@@ -14,7 +14,8 @@
     "REMOTE_PROVIDER_UNSUPPORTED": "このプロバイダーは SSH リモートセッションに対応していません。別のソースを選択してください",
     "REMOTE_NATIVE_OAUTH_UNAVAILABLE": "Claude.ai サブスクリプションが未接続です。先に接続するか、ゲートウェイモデルを選択してください",
     "DEVICE_LINK_DEVICE_UNRESPONSIVE": "対象デバイスが応答していません。リモートデバイスを確認して再試行してください。",
-    "INTERNAL": "操作に失敗しました。しばらくしてから再試行してください。"
+    "INTERNAL": "操作に失敗しました。しばらくしてから再試行してください。",
+    "SSH_CONFIG_RELOAD_REQUIRED": "SSH 設定は保存されましたが、Cindy で再読み込みできませんでした。SSH 設定を再読み込みしてください。"
   },
   "providerError": {
     "AUTH_INVALID": "API キーが無効か期限切れです（401）。キーを確認して再試行してください",
@@ -158,6 +159,13 @@
       "title": "リモートマシン",
       "footnote": "Phase A は SSH 接続管理のみ。リモートでのエージェント実行は今後のアップデートで対応します。",
       "viaAuth": "{{label}} で認証",
+      "readOnlyFromSshConfig": "接続情報は SSH 設定から読み込まれています",
+      "configWarning": "一部の SSH 設定ルールを Cindy では評価できません。ホスト一覧や接続情報がターミナルの SSH と異なる場合があります。",
+      "configDiagnostic": {
+        "io": "Cindy は SSH 設定を読み込めませんでした。最後に正常に読み込んだホストを引き続き表示しています。ファイルのアクセス権を確認して、再読み込みしてください。",
+        "syntax": "Cindy は SSH 設定を解析できませんでした。最後に正常に読み込んだホストを引き続き表示しています。設定を修正して、再読み込みしてください。",
+        "limit": "SSH 設定のネストが深すぎるか、サイズが大きすぎるため、Cindy で安全に読み込めません。最後に正常に読み込んだホストを引き続き表示しています。"
+      },
       "empty": {
         "title": "リモートマシンはまだありません。",
         "hint": "「追加」で登録するか、更新アイコンで ~/.ssh/config から取り込めます。"
@@ -189,7 +197,8 @@
       },
       "edit": {
         "title": "{{id}} を編集",
-        "submit": "変更を保存"
+        "submit": "変更を保存",
+        "connectionFieldsReadOnly": "SSH 設定から読み込まれた接続情報はここでは読み取り専用です。表示名、自動接続、Agent Proxy は変更できます。"
       },
       "keys": {
         "title": "SSH 鍵を設定",
@@ -266,6 +275,8 @@
       "add": {
         "title": "リモートマシンを追加",
         "alias": "エイリアス",
+        "displayName": "表示名",
+        "displayNamePlaceholder": "任意。Cindy 内でのみ表示",
         "hostname": "ホスト名",
         "user": "ユーザー",
         "port": "ポート",

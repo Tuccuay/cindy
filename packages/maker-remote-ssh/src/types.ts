@@ -16,27 +16,30 @@ export type RemoteStatus =
 export type AuthMethod = 'agent' | 'key';
 
 /**
- * Source of truth for a host entry. `ssh-config` = parsed from
- * `~/.ssh/config`; `manual` = added via maker UI (also written back to
- * `~/.ssh/config` so terminal `ssh <alias>` keeps working).
+ * `manual` remains only for older in-memory fixtures. Hosts hydrated from
+ * disk always use `ssh-config`; ownership is represented independently by
+ * `managedByCindy`.
  */
 export type HostSource = 'ssh-config' | 'manual';
 
 /**
  * One remote machine known to maker. `id` doubles as the SSH alias
- * (the `Host <id>` line in ~/.ssh/config) — they must match so that
- * round-tripping through the config file is lossless.
+ * (the concrete `Host <id>` declaration discovered from OpenSSH config).
  */
 export interface HostConfig {
-  /** alias / unique key. Also the `Host` directive in ~/.ssh/config. */
+  /** alias / unique key. Also the concrete OpenSSH `Host` name. */
   id: string;
+  /** Desktop may project a local preference here; never participates in SSH lookup. */
+  displayName?: string;
   hostname: string;
   port: number;
   user: string;
   authMethod: AuthMethod;
-  /** absolute path; only meaningful when authMethod === 'key'. */
+  /** Absolute key path; direct key for `key`, optional agent pin for `agent`. */
   identityFile?: string;
   source: HostSource;
+  /** True only for a unique single-alias block in Cindy's managed SSH file. */
+  managedByCindy: boolean;
 }
 
 /** Snapshot of a host's runtime state for renderer. */

@@ -1,7 +1,7 @@
 /**
  * @cindy/maker-remote-ssh — SSH remote host management for xdt-maker.
  *
- * Phase A: connection lifecycle + ~/.ssh/config IO + credential resolution.
+ * Phase A: connection lifecycle + OpenSSH discovery/managed writes + credential resolution.
  * Phase B (next): bootstrap agent CLI on remote + RemoteAgent that spawns
  * claude/codex over an exec channel + session ingest.
  */
@@ -101,12 +101,24 @@ export {
 export type { HostKeyStore, HostKeyDecision } from './hostKeys.js';
 
 export {
+  addManagedHost,
+  addManagedHostWithInclude,
+  defaultManagedSshConfigPath,
   defaultSshConfigPath,
+  ensureManagedConfigInclude,
   readSshConfig,
+  readSshConfigDetailed,
+  removeManagedHost,
+  updateManagedHostFields,
   upsertHost,
   updateHostFields,
   removeHost,
   expandHome,
+} from './sshConfig.js';
+export type {
+  ReadSshConfigOptions,
+  ReadSshConfigResult,
+  SshConfigDiagnostic,
 } from './sshConfig.js';
 
 export {

@@ -83,6 +83,7 @@ const HOST_CFG = {
   user: 'deploy',
   authMethod: 'agent' as const,
   source: 'manual' as const,
+  managedByCindy: false,
 };
 
 const TUNNEL_PREF: SshHostAgentProxyPref = {

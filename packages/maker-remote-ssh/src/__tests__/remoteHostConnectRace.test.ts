@@ -37,7 +37,10 @@ class FakeClient extends EventEmitter {
   }
 }
 
-const h = vi.hoisted(() => ({ client: null as FakeClient | null }));
+const h = vi.hoisted(() => ({
+  client: null as FakeClient | null,
+  resolveAuth: vi.fn(async () => ({ label: 'agent' })),
+}));
 
 vi.mock('ssh2', () => ({
   Client: vi.fn(() => {
@@ -46,7 +49,7 @@ vi.mock('ssh2', () => ({
   }),
 }));
 vi.mock('../credentials.js', () => ({
-  resolveAuth: vi.fn(async () => ({ label: 'agent' })),
+  resolveAuth: h.resolveAuth,
   defaultAgentEndpoint: vi.fn(() => ''),
 }));
 
@@ -60,6 +63,7 @@ const HOST_CONFIG: HostConfig = {
   user: 'deploy',
   authMethod: 'agent',
   source: 'manual',
+  managedByCindy: false,
 };
 
 const noopLogger = {
@@ -111,5 +115,42 @@ describe('RemoteHost arm/disconnect race', () => {
     ]);
     // 旧连接上刚绑上的野监听必须立刻拆除。
     expect(client.unforwardInCalls).toContainEqual({ addr: '127.0.0.1', port: 47921 });
+  });
+
+  it('disconnect during credential resolution does not create an SSH client later', async () => {
+    h.client = null;
+    let finishAuth!: (value: { label: string }) => void;
+    h.resolveAuth.mockImplementationOnce(() => new Promise((resolve) => {
+      finishAuth = resolve;
+    }));
+    const host = new RemoteHost(HOST_CONFIG, { logger: noopLogger });
+
+    const connectP = host.connect();
+    await Promise.resolve();
+    expect(host.getStatus()).toBe('connecting');
+
+    await host.disconnect();
+    finishAuth({ label: 'agent' });
+
+    await expect(connectP).rejects.toThrow('SSH connection attempt cancelled');
+    expect(h.client).toBeNull();
+    expect(host.getStatus()).toBe('disconnected');
+  });
+
+  it('disconnect before SSH ready invalidates late client events', async () => {
+    h.client = null;
+    const host = new RemoteHost(HOST_CONFIG, { logger: noopLogger });
+
+    const connectP = host.connect();
+    await flush();
+    const client = h.client!;
+    expect(client).toBeTruthy();
+
+    await host.disconnect();
+    client.emit('ready');
+
+    await expect(connectP).rejects.toThrow('SSH connection attempt cancelled');
+    expect(client.ended).toBe(true);
+    expect(host.getStatus()).toBe('disconnected');
   });
 });

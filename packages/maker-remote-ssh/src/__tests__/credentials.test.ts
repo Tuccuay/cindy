@@ -26,6 +26,7 @@ function keyHost(over: Partial<HostConfig> & Pick<HostConfig, 'identityFile'>): 
     user: 'admin',
     authMethod: 'key',
     source: 'manual',
+    managedByCindy: false,
     ...over,
   };
 }

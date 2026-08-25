@@ -1,415 +1,614 @@
-/**
- * Tests for sshConfig — read/write `~/.ssh/config` blocks.
- *
- * Why these tests matter:
- *   sshConfig is the persistence layer for every host the user adds. A
- *   regression in the round-trip silently corrupts `~/.ssh/config` and
- *   takes down the user's normal terminal SSH too — not just ours.
- *
- *   The separator regression is the load-bearing one: an earlier version
- *   synthesised new directive nodes without a `separator` field, and
- *   ssh-config's `toString()` emitted `IdentityFileundefined/path` which
- *   was unparseable. The bug touched real user files. The
- *   `updateHostFields inserts a new IdentityFile cleanly` test pins
- *   that fix so it can't silently come back.
- */
-
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  addManagedHost,
+  addManagedHostWithInclude,
+  ensureManagedConfigInclude,
   expandHome,
   readSshConfig,
-  removeHost,
-  updateHostFields,
-  upsertHost,
+  readSshConfigDetailed,
+  removeManagedHost,
+  updateManagedHostFields,
 } from '../sshConfig.js';
 import type { HostConfig } from '../types.js';
 
-// ── per-test scratch file ────────────────────────────────────────────────────
-
 let scratchDir: string;
-let scratchFile: string;
+let mainConfig: string;
+let managedConfig: string;
 
 beforeEach(async () => {
-  scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sshconfig-test-'));
-  scratchFile = path.join(scratchDir, 'config');
+  scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cindy-ssh-config-'));
+  mainConfig = path.join(scratchDir, 'config');
+  managedConfig = path.join(scratchDir, 'cindy.conf');
 });
 
 afterEach(async () => {
   await fs.rm(scratchDir, { recursive: true, force: true });
 });
 
-function host(over: Partial<HostConfig> & Pick<HostConfig, 'id'>): HostConfig {
+function host(overrides: Partial<HostConfig> & Pick<HostConfig, 'id'>): HostConfig {
   return {
-    hostname: 'example.com',
+    hostname: '192.0.2.10',
     port: 22,
-    user: 'me',
+    user: 'developer',
     authMethod: 'agent',
     source: 'ssh-config',
-    ...over,
+    managedByCindy: true,
+    ...overrides,
   };
 }
 
-// ── readSshConfig ────────────────────────────────────────────────────────────
-
-describe('readSshConfig', () => {
-  it('returns empty array when the file does not exist', async () => {
-    expect(await readSshConfig(scratchFile)).toEqual([]);
+describe('OpenSSH config discovery', () => {
+  it('returns an empty list for a missing main config', async () => {
+    await expect(readSshConfig(mainConfig)).resolves.toEqual([]);
   });
 
-  it('recognizes Host directives case-insensitively', async () => {
-    await fs.writeFile(scratchFile, [
-      'host lowercase',
-      '  hostname 10.0.0.1',
-      '  user alice',
-      '',
-      'hOsT mixedcase',
-      '  HoStNaMe 10.0.0.2',
-      '  UsEr bob',
-      '',
-    ].join('\n'));
-
-    const hosts = await readSshConfig(scratchFile);
-    expect(hosts).toMatchObject([
-      { id: 'lowercase', hostname: '10.0.0.1', user: 'alice' },
-      { id: 'mixedcase', hostname: '10.0.0.2', user: 'bob' },
-    ]);
+  it('warns when the main config is missing but an unmanaged Cindy file exists', async () => {
+    await fs.writeFile(managedConfig, 'Host unreachable\n');
+    const result = await readSshConfigDetailed(mainConfig, { managedConfigPath: managedConfig });
+    expect(result.hosts).toEqual([]);
+    expect(result.warnings[0]).toContain('not reachable');
   });
 
-  it('skips wildcard / pattern / negated host entries', async () => {
-    await fs.writeFile(scratchFile, [
+  it('uses bare aliases and excludes wildcard, negated, and character-class patterns', async () => {
+    await fs.writeFile(mainConfig, [
       'Host *',
-      '  ServerAliveInterval 60',
-      '',
-      'Host concrete',
-      '  HostName 10.0.0.1',
-      '  User alice',
-      '',
-      'Host has?wildcard',
-      '  HostName 10.0.0.2',
-      '',
-      'Host !excluded',
-      '  HostName 10.0.0.3',
-      '',
-    ].join('\n'));
-    const hosts = await readSshConfig(scratchFile);
-    expect(hosts.map(h => h.id)).toEqual(['concrete']);
-  });
-});
-
-// ── expandHome — Windows 路径形态 ─────────────────────────────────────────────
-
-describe('expandHome', () => {
-  const home = os.homedir();
-
-  it('expands a bare tilde', () => {
-    expect(expandHome('~')).toBe(home);
-  });
-
-  it('expands POSIX-style ~/ prefix', () => {
-    expect(expandHome('~/.ssh/id_ed25519')).toBe(path.join(home, '.ssh', 'id_ed25519'));
-  });
-
-  it('expands Windows-style ~\\ prefix', () => {
-    expect(expandHome('~\\.ssh\\id_ed25519')).toBe(path.join(home, '.ssh', 'id_ed25519'));
-  });
-
-  it('leaves an already-absolute Windows drive path untouched (backslashes preserved)', () => {
-    const p = String.raw`C:\Users\foo\.ssh\id_ed25519`;
-    expect(expandHome(p)).toBe(p);
-  });
-
-  it('leaves forward-slash absolute paths untouched', () => {
-    const p = 'C:/Users/foo/.ssh/id_ed25519';
-    expect(expandHome(p)).toBe(p);
-  });
-
-  it('leaves UNC paths untouched', () => {
-    const p = String.raw`\\nas\share\keys\id_ed25519`;
-    expect(expandHome(p)).toBe(p);
-  });
-
-  it('leaves paths with spaces untouched', () => {
-    const p = String.raw`C:\Users\my name\.ssh\id_ed25519`;
-    expect(expandHome(p)).toBe(p);
-  });
-});
-
-// ── upsertHost + readSshConfig round-trip ────────────────────────────────────
-
-describe('upsertHost round-trip', () => {
-  it('replaces an existing lowercase host block when alias collides', async () => {
-    await fs.writeFile(scratchFile, [
-      'host foo',
-      '  hostname old',
-      '  user me',
-      '  ProxyJump bastion',
+      '  User root',
+      'Host exact',
+      '  HostName 192.0.2.1',
+      'Host foo? web[0-9] !blocked',
+      '  HostName 192.0.2.2',
       '',
     ].join('\n'));
 
-    await upsertHost(host({ id: 'foo', hostname: 'new', user: 'me' }), scratchFile);
-
-    const raw = await fs.readFile(scratchFile, 'utf8');
-    expect(raw).not.toMatch(/hostname old/i);
-    expect(raw).toMatch(/Host foo/);
-    expect(raw).toMatch(/HostName new/);
-    expect(raw).not.toMatch(/ProxyJump bastion/);
-    expect(await readSshConfig(scratchFile)).toMatchObject([
-      { id: 'foo', hostname: 'new' },
+    await expect(readSshConfig(mainConfig)).resolves.toMatchObject([
+      { id: 'exact', hostname: '192.0.2.1', user: 'root', managedByCindy: false },
     ]);
   });
 
-  it('round-trips an agent-only host (no IdentityFile)', async () => {
-    const h = host({ id: 'foo', hostname: '10.0.0.1', user: 'alice', authMethod: 'agent' });
-    await upsertHost(h, scratchFile);
-    const back = await readSshConfig(scratchFile);
-    expect(back).toHaveLength(1);
-    expect(back[0]).toMatchObject({
-      id: 'foo',
-      hostname: '10.0.0.1',
-      user: 'alice',
+  it('keeps token-internal hashes in aliases and IdentityFile values', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host foo#bar # alias comment',
+      '  HostName 192.0.2.2',
+      '  IdentityFile keys/id#deploy # path comment',
+      '',
+    ].join('\n'));
+
+    await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
+      id: 'foo#bar',
+      hostname: '192.0.2.2',
+      identityFile: path.join(scratchDir, 'keys', 'id#deploy'),
+    }]);
+  });
+
+  it('expands root Include recursively, relative to the main config directory', async () => {
+    await fs.mkdir(path.join(scratchDir, 'config.d'));
+    await fs.writeFile(mainConfig, 'Include config.d/entry.conf\n');
+    await fs.writeFile(path.join(scratchDir, 'config.d', 'entry.conf'), 'Include nested.conf\n');
+    await fs.writeFile(path.join(scratchDir, 'nested.conf'), [
+      'Host nested',
+      '  HostName 192.0.2.3',
+      '  IdentityFile keys/nested.key',
+      '',
+    ].join('\n'));
+
+    await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
+      id: 'nested',
+      hostname: '192.0.2.3',
+      identityFile: path.join(scratchDir, 'keys', 'nested.key'),
+    }]);
+  });
+
+  it.each(['Include config.d/*', '  Include config.d/*'])(
+    'expands Include inside a pure Host * block regardless of indentation: %s',
+    async (includeLine) => {
+      await fs.mkdir(path.join(scratchDir, 'config.d'));
+      await fs.writeFile(mainConfig, ['Host *', includeLine, ''].join('\n'));
+      await fs.writeFile(path.join(scratchDir, 'config.d', 'lab.conf'), [
+        'Host lab',
+        '  HostName 192.0.2.4',
+        '',
+      ].join('\n'));
+
+      await expect(readSshConfig(mainConfig)).resolves.toMatchObject([
+        { id: 'lab', hostname: '192.0.2.4' },
+      ]);
+    },
+  );
+
+  it('does not expand Include in a concrete Host block and returns a warning', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host outer',
+      'Include conditional.conf',
+      '',
+    ].join('\n'));
+    await fs.writeFile(path.join(scratchDir, 'conditional.conf'), 'Host ghost\n');
+
+    const result = await readSshConfigDetailed(mainConfig);
+    expect(result.hosts.map((item) => item.id)).toEqual(['outer']);
+    expect(result.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining('conditional Include was not expanded'),
+    ]));
+  });
+
+  it('does not evaluate Match blocks or Match exec', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host target',
+      '  HostName 192.0.2.5',
+      'Match exec "touch should-not-run"',
+      '  User attacker',
+      'Match all',
+      '  Port 2222',
+      '',
+    ].join('\n'));
+
+    const result = await readSshConfigDetailed(mainConfig);
+    expect(result.hosts).toMatchObject([{
+      id: 'target',
+      user: os.userInfo().username,
       port: 22,
+    }]);
+    expect(result.warnings.filter((warning) => warning.includes('Match is not evaluated')))
+      .toHaveLength(2);
+  });
+
+  it('restores the parent Host * scope after an included file returns', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host *',
+      '  User ubuntu',
+      '  Include extra.conf',
+      '  Port 2222',
+      'Host foo',
+      '  HostName 192.0.2.6',
+      '',
+    ].join('\n'));
+    await fs.writeFile(path.join(scratchDir, 'extra.conf'), [
+      'Host included',
+      '  HostName 192.0.2.7',
+      '',
+    ].join('\n'));
+
+    const hosts = await readSshConfig(mainConfig);
+    expect(hosts.find((item) => item.id === 'foo')).toMatchObject({
+      user: 'ubuntu',
+      port: 2222,
+    });
+  });
+
+  it('deduplicates cycles and repeated physical Include files', async () => {
+    await fs.writeFile(mainConfig, 'Include a.conf a.conf\n');
+    await fs.writeFile(path.join(scratchDir, 'a.conf'), [
+      'Include b.conf',
+      'Host a',
+      '',
+    ].join('\n'));
+    await fs.writeFile(path.join(scratchDir, 'b.conf'), [
+      'Include a.conf',
+      'Host b',
+      '',
+    ].join('\n'));
+
+    await expect(readSshConfig(mainConfig)).resolves.toMatchObject([
+      { id: 'b' },
+      { id: 'a' },
+    ]);
+  });
+
+  it('applies first-value-wins to HostName/User/Port and does not chain HostName aliases', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host *',
+      '  User root',
+      '  Port 2200',
+      'Host short',
+      '  HostName long',
+      '  User developer',
+      '  Port 2222',
+      'Host long',
+      '  HostName 192.0.2.8',
+      '',
+    ].join('\n'));
+
+    const hosts = await readSshConfig(mainConfig);
+    expect(hosts.find((item) => item.id === 'short')).toMatchObject({
+      hostname: 'long',
+      user: 'root',
+      port: 2200,
+    });
+  });
+
+  it('prefers a concrete IdentityFile over an earlier Host * IdentityFile', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host *',
+      '  IdentityFile ~/.ssh/id_ed25519',
+      'Host lab',
+      '  HostName 192.0.2.9',
+      '  IdentityFile ~/.ssh/lab.key',
+      '',
+    ].join('\n'));
+
+    await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
+      id: 'lab',
+      authMethod: 'key',
+      identityFile: path.join(os.homedir(), '.ssh', 'lab.key'),
+    }]);
+  });
+
+  it('inherits Host * IdentityFile and treats it as key when the introducing block has no marker', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host foo',
+      '  HostName 192.0.2.10',
+      'Host *',
+      '  IdentityFile ~/.ssh/id_ed25519',
+      '',
+    ].join('\n'));
+
+    await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
+      id: 'foo',
+      authMethod: 'key',
+      identityFile: path.join(os.homedir(), '.ssh', 'id_ed25519'),
+    }]);
+  });
+
+  it('takes the auth marker only from the first concrete declaration introducing an alias', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host duplicate',
+      '  # xdt-maker:auth=key',
+      '  IdentityFile first.key',
+      'Host duplicate',
+      '  # xdt-maker:auth=agent',
+      '',
+    ].join('\n'));
+
+    await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
+      id: 'duplicate',
+      authMethod: 'key',
+      identityFile: path.join(scratchDir, 'first.key'),
+    }]);
+  });
+
+  it('lists each alias in Host foo bar but keeps both read-only', async () => {
+    await fs.writeFile(mainConfig, `Include ${managedConfig}\n`);
+    await fs.writeFile(managedConfig, [
+      'Host foo bar',
+      '  HostName 192.0.2.11',
+      '',
+    ].join('\n'));
+
+    const hosts = await readSshConfig(mainConfig, { managedConfigPath: managedConfig });
+    expect(hosts).toMatchObject([
+      { id: 'foo', managedByCindy: false },
+      { id: 'bar', managedByCindy: false },
+    ]);
+  });
+
+  it('reports Include limits as diagnostics instead of partial host lists', async () => {
+    await fs.writeFile(mainConfig, 'Include level-1.conf\n');
+    for (let level = 1; level <= 17; level += 1) {
+      await fs.writeFile(
+        path.join(scratchDir, `level-${level}.conf`),
+        level === 17 ? 'Host too-deep\n' : `Include level-${level + 1}.conf\n`,
+      );
+    }
+
+    const result = await readSshConfigDetailed(mainConfig);
+    expect(result.hosts).toEqual([]);
+    expect(result.diagnostic).toMatchObject({ kind: 'limit' });
+  });
+});
+
+describe('managed ownership', () => {
+  it('marks only a unique single-alias declaration in the supplied managed file', async () => {
+    await fs.writeFile(mainConfig, `Include ${managedConfig}\n`);
+    await fs.writeFile(managedConfig, 'Host managed\n  HostName 192.0.2.20\n');
+
+    await expect(readSshConfig(mainConfig, { managedConfigPath: managedConfig }))
+      .resolves.toMatchObject([{ id: 'managed', source: 'ssh-config', managedByCindy: true }]);
+  });
+
+  it('keeps managed aliases read-only when duplicated in any other file', async () => {
+    await fs.writeFile(mainConfig, [
+      `Include ${managedConfig}`,
+      'Include external.conf',
+      '',
+    ].join('\n'));
+    await fs.writeFile(managedConfig, 'Host duplicate\n  HostName 192.0.2.21\n');
+    await fs.writeFile(path.join(scratchDir, 'external.conf'), 'Host duplicate\n');
+
+    await expect(readSshConfig(mainConfig, { managedConfigPath: managedConfig }))
+      .resolves.toMatchObject([{ id: 'duplicate', managedByCindy: false }]);
+  });
+
+  it('marks every host read-only when managedConfigPath is omitted', async () => {
+    await fs.writeFile(mainConfig, `Include ${managedConfig}\n`);
+    await fs.writeFile(managedConfig, 'Host managed\n');
+
+    await expect(readSshConfig(mainConfig)).resolves.toMatchObject([
+      { id: 'managed', managedByCindy: false },
+    ]);
+  });
+
+  it('warns without discovering an existing managed file that is not Included', async () => {
+    await fs.writeFile(mainConfig, 'Host external\n');
+    await fs.writeFile(managedConfig, 'Host unreachable\n');
+
+    const result = await readSshConfigDetailed(mainConfig, { managedConfigPath: managedConfig });
+    expect(result.hosts.map((item) => item.id)).toEqual(['external']);
+    expect(result.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining('not reachable'),
+    ]));
+  });
+
+  it('warns when a later Include glob reaches the managed file again', async () => {
+    await fs.writeFile(mainConfig, [
+      `Include ${managedConfig}`,
+      `Include ${path.join(scratchDir, '*.conf')}`,
+      '',
+    ].join('\n'));
+    await fs.writeFile(managedConfig, 'Host managed\n');
+
+    const result = await readSshConfigDetailed(mainConfig, { managedConfigPath: managedConfig });
+    expect(result.hosts.map((item) => item.id)).toEqual(['managed']);
+    expect(result.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining('already loaded'),
+    ]));
+  });
+});
+
+describe('managed config writers', () => {
+  it('inserts one canonical Include after leading comments/blanks and before Host *', async () => {
+    await fs.writeFile(mainConfig, [
+      '# user comment',
+      '',
+      'Host *',
+      '  User ubuntu',
+      `  Include="${managedConfig}"`,
+      `Include ${path.join(scratchDir, '*.conf')}`,
+      '',
+    ].join('\n'));
+
+    await ensureManagedConfigInclude(mainConfig, managedConfig);
+    const raw = await fs.readFile(mainConfig, 'utf8');
+    expect(raw).toBe([
+      '# user comment',
+      '',
+      `Include ${managedConfig}`,
+      'Host *',
+      '  User ubuntu',
+      `Include ${path.join(scratchDir, '*.conf')}`,
+      '',
+    ].join('\n'));
+  });
+
+  it('recognizes equivalent exact Include forms, deduplicates them, and preserves comments', async () => {
+    await fs.writeFile(mainConfig, [
+      '# header',
+      'Include=cindy.conf # keep relative note',
+      `Include "${managedConfig}" # keep duplicate note`,
+      'Host foo',
+      '',
+    ].join('\n'));
+
+    await ensureManagedConfigInclude(mainConfig, managedConfig);
+    const raw = await fs.readFile(mainConfig, 'utf8');
+    expect(raw).toBe([
+      '# header',
+      `Include ${managedConfig} # keep relative note`,
+      '# keep duplicate note',
+      'Host foo',
+      '',
+    ].join('\n'));
+  });
+
+  it('does not move an exact Include from Host foo and adds a root Include', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host foo',
+      `  Include ${managedConfig}`,
+      '',
+    ].join('\n'));
+
+    await ensureManagedConfigInclude(mainConfig, managedConfig);
+    const raw = await fs.readFile(mainConfig, 'utf8');
+    expect(raw).toBe([
+      `Include ${managedConfig}`,
+      'Host foo',
+      `  Include ${managedConfig}`,
+      '',
+    ].join('\n'));
+  });
+
+  it('preserves CRLF and file permissions in the main config', async () => {
+    await fs.writeFile(mainConfig, '# comment\r\nHost foo\r\n', { mode: 0o640 });
+    await fs.chmod(mainConfig, 0o640);
+    const modeBefore = (await fs.stat(mainConfig)).mode & 0o777;
+
+    await ensureManagedConfigInclude(mainConfig, managedConfig);
+    const raw = await fs.readFile(mainConfig, 'utf8');
+    expect(raw).toContain(`\r\nInclude ${managedConfig}\r\n`);
+    expect(raw.replace(/\r\n/g, '')).not.toContain('\n');
+    if (modeBefore === 0o640) {
+      expect((await fs.stat(mainConfig)).mode & 0o777).toBe(modeBefore);
+    }
+  });
+
+  it('writes through an existing symlink without replacing the link', async ({ skip }) => {
+    const target = path.join(scratchDir, 'real-config');
+    await fs.writeFile(target, 'Host foo\n');
+    try {
+      await fs.symlink(target, mainConfig);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EPERM' || code === 'EACCES') return skip();
+      throw error;
+    }
+
+    await ensureManagedConfigInclude(mainConfig, managedConfig);
+    expect((await fs.lstat(mainConfig)).isSymbolicLink()).toBe(true);
+    await expect(fs.readFile(target, 'utf8')).resolves.toContain(`Include ${managedConfig}`);
+  });
+
+  it('rejects a broken symlink instead of replacing it', async ({ skip }) => {
+    try {
+      await fs.symlink(path.join(scratchDir, 'missing-target'), mainConfig);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EPERM' || code === 'EACCES') return skip();
+      throw error;
+    }
+    await expect(ensureManagedConfigInclude(mainConfig, managedConfig)).rejects.toThrow();
+    expect((await fs.lstat(mainConfig)).isSymbolicLink()).toBe(true);
+  });
+
+  it('adds a marked host, rereads it as managed, and removes it', async () => {
+    await fs.writeFile(mainConfig, `Include ${managedConfig}\n`);
+    await addManagedHost(host({
+      id: 'new-host',
+      authMethod: 'agent',
+      identityFile: '/tmp/id_ed25519.pub',
+    }), managedConfig);
+
+    const raw = await fs.readFile(managedConfig, 'utf8');
+    expect(raw).toContain('# xdt-maker:auth=agent');
+    await expect(readSshConfig(mainConfig, { managedConfigPath: managedConfig }))
+      .resolves.toMatchObject([{
+        id: 'new-host',
+        source: 'ssh-config',
+        managedByCindy: true,
+        authMethod: 'agent',
+      }]);
+
+    await removeManagedHost('new-host', managedConfig);
+    await expect(fs.readFile(managedConfig, 'utf8')).resolves.toBe('');
+  });
+
+  it('quotes managed IdentityFile values without losing spaces, hashes, quotes, or backslashes', async () => {
+    const identityFile = path.join(scratchDir, 'My Keys', 'id#deploy"copy\\final');
+    await fs.writeFile(mainConfig, `Include ${managedConfig}\n`);
+    await addManagedHost(host({
+      id: 'special#alias',
+      authMethod: 'key',
+      identityFile,
+    }), managedConfig);
+
+    const raw = await fs.readFile(managedConfig, 'utf8');
+    expect(raw).toContain('IdentityFile "');
+    await expect(readSshConfig(mainConfig, { managedConfigPath: managedConfig }))
+      .resolves.toMatchObject([{
+        id: 'special#alias',
+        authMethod: 'key',
+        identityFile,
+      }]);
+  });
+
+  it('does not publish an Include for a malformed pre-existing managed file', async () => {
+    const originalMain = 'Host external\n  HostName 192.0.2.50\n';
+    await fs.writeFile(mainConfig, originalMain);
+    await fs.writeFile(managedConfig, 'Host broken\n  IdentityFile "unterminated\n');
+
+    await expect(addManagedHostWithInclude(host({ id: 'new-host' }), mainConfig, managedConfig))
+      .rejects.toThrow();
+    await expect(fs.readFile(mainConfig, 'utf8')).resolves.toBe(originalMain);
+  });
+
+  it('restores managed bytes when publishing the Include fails', async ({ skip }) => {
+    const originalManaged = 'Host existing\n  HostName 192.0.2.60\n';
+    await fs.writeFile(managedConfig, originalManaged);
+    try {
+      await fs.symlink(path.join(scratchDir, 'missing-main-target'), mainConfig);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EPERM' || code === 'EACCES') return skip();
+      throw error;
+    }
+
+    await expect(addManagedHostWithInclude(host({ id: 'new-host' }), mainConfig, managedConfig))
+      .rejects.toThrow();
+    await expect(fs.readFile(managedConfig, 'utf8')).resolves.toBe(originalManaged);
+    expect((await fs.lstat(mainConfig)).isSymbolicLink()).toBe(true);
+  });
+
+  it('keeps an unpinned managed agent host as agent when Host * supplies a key', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host *',
+      '  IdentityFile ~/.ssh/id_ed25519',
+      `Include ${managedConfig}`,
+      '',
+    ].join('\n'));
+    await addManagedHost(host({
+      id: 'agent-host',
       authMethod: 'agent',
       identityFile: undefined,
-    });
+    }), managedConfig);
+
+    await expect(fs.readFile(managedConfig, 'utf8')).resolves.toContain('# xdt-maker:auth=agent');
+    await expect(readSshConfig(mainConfig, { managedConfigPath: managedConfig }))
+      .resolves.toMatchObject([{
+        id: 'agent-host',
+        authMethod: 'agent',
+        identityFile: undefined,
+        managedByCindy: true,
+      }]);
   });
 
-  it('round-trips a key-file host (authMethod=key)', async () => {
-    const h = host({
-      id: 'bar',
-      hostname: '10.0.0.2',
-      user: 'bob',
-      port: 2222,
-      authMethod: 'key',
-      identityFile: '/home/bob/.ssh/id_ed25519',
-    });
-    await upsertHost(h, scratchFile);
-    const back = await readSshConfig(scratchFile);
-    expect(back).toHaveLength(1);
-    expect(back[0]).toMatchObject({
-      id: 'bar',
-      hostname: '10.0.0.2',
-      user: 'bob',
-      port: 2222,
-      authMethod: 'key',
-      identityFile: '/home/bob/.ssh/id_ed25519',
-    });
-  });
-
-  it('round-trips an agent + pinned key host (authMethod=agent, identityFile set)', async () => {
-    const h = host({
-      id: 'baz',
-      hostname: '10.0.0.3',
-      user: 'carol',
-      authMethod: 'agent',
-      identityFile: '/home/carol/.ssh/id_ed25519.pub',
-    });
-    await upsertHost(h, scratchFile);
-    const back = await readSshConfig(scratchFile);
-    expect(back).toHaveLength(1);
-    expect(back[0].authMethod).toBe('agent');
-    expect(back[0].identityFile).toBe('/home/carol/.ssh/id_ed25519.pub');
-  });
-
-  it('replaces an existing host block when alias collides', async () => {
-    await upsertHost(host({ id: 'foo', hostname: 'old', user: 'me' }), scratchFile);
-    await upsertHost(host({ id: 'foo', hostname: 'new', user: 'me' }), scratchFile);
-    const back = await readSshConfig(scratchFile);
-    expect(back).toHaveLength(1);
-    expect(back[0].hostname).toBe('new');
-  });
-});
-
-// ── updateHostFields — the separator regression test ────────────────────────
-
-describe('updateHostFields', () => {
-  it('inserts a new IdentityFile directive with a separator so the file is re-readable', async () => {
-    // Set up: agent-only host on disk, no IdentityFile.
-    await upsertHost(host({ id: 'foo', hostname: '10.0.0.1', user: 'alice', authMethod: 'agent' }), scratchFile);
-
-    // Switch it to key-file mode → updateHostFields must INSERT a new
-    // IdentityFile directive (separator must be set, else serializer
-    // emits 'IdentityFileundefined/path/key' which is unparseable).
-    await updateHostFields(host({
-      id: 'foo',
-      hostname: '10.0.0.1',
-      user: 'alice',
-      authMethod: 'key',
-      identityFile: '/home/alice/.ssh/id_ed25519',
-    }), scratchFile);
-
-    // Regression assert #1: raw file contents have no `IdentityFileundefined`.
-    const raw = await fs.readFile(scratchFile, 'utf8');
-    expect(raw).not.toContain('undefined');
-    expect(raw).toMatch(/IdentityFile\s+\/home\/alice\/\.ssh\/id_ed25519/);
-
-    // Regression assert #2: the file is re-parseable and yields the expected host.
-    const back = await readSshConfig(scratchFile);
-    expect(back).toHaveLength(1);
-    expect(back[0]).toMatchObject({
-      id: 'foo',
-      authMethod: 'key',
-      identityFile: '/home/alice/.ssh/id_ed25519',
-    });
-  });
-
-  it('removes IdentityFile + IdentitiesOnly when switching back to agent', async () => {
-    await upsertHost(host({
-      id: 'foo',
-      hostname: '10.0.0.1',
-      user: 'alice',
-      authMethod: 'key',
-      identityFile: '/home/alice/.ssh/id_ed25519',
-    }), scratchFile);
-
-    await updateHostFields(host({
-      id: 'foo',
-      hostname: '10.0.0.1',
-      user: 'alice',
-      authMethod: 'agent',
-    }), scratchFile);
-
-    const raw = await fs.readFile(scratchFile, 'utf8');
-    expect(raw).not.toMatch(/IdentityFile/);
-    expect(raw).not.toMatch(/IdentitiesOnly/);
-
-    const back = await readSshConfig(scratchFile);
-    expect(back[0].authMethod).toBe('agent');
-    expect(back[0].identityFile).toBeUndefined();
-  });
-
-  it('preserves hand-written directives the user added (ProxyJump, ServerAliveInterval)', async () => {
-    // Seed: a host with extra directives the user manually wrote.
-    await fs.writeFile(scratchFile, [
-      'Host foo',
-      '  HostName 10.0.0.1',
+  it('surgically updates owned fields without deleting ProxyJump or other directives', async () => {
+    await fs.writeFile(managedConfig, [
+      'Host lab',
+      '  HostName 192.0.2.30',
       '  User alice',
       '  ProxyJump bastion',
       '  ServerAliveInterval 60',
       '',
     ].join('\n'));
 
-    // Surgical update — change port only.
-    await updateHostFields(host({
-      id: 'foo',
-      hostname: '10.0.0.1',
-      user: 'alice',
-      port: 2222,
-      authMethod: 'agent',
-    }), scratchFile);
-
-    const raw = await fs.readFile(scratchFile, 'utf8');
-    expect(raw).toMatch(/ProxyJump\s+bastion/);
-    expect(raw).toMatch(/ServerAliveInterval\s+60/);
-    expect(raw).toMatch(/Port\s+2222/);
-  });
-
-  it('updates a lowercase host block without replacing hand-written directives', async () => {
-    await fs.writeFile(scratchFile, [
-      'host foo',
-      '  hostname 10.0.0.1',
-      '  user alice',
-      '  ProxyJump bastion',
-      '',
-    ].join('\n'));
-
-    await updateHostFields(host({
-      id: 'foo',
-      hostname: '10.0.0.2',
+    await updateManagedHostFields(host({
+      id: 'lab',
+      hostname: '192.0.2.31',
       user: 'bob',
       port: 2222,
-      authMethod: 'agent',
-    }), scratchFile);
-
-    const raw = await fs.readFile(scratchFile, 'utf8');
-    expect(raw).toMatch(/^host foo/m);
-    expect(raw).toMatch(/HostName\s+10\.0\.0\.2/i);
-    expect(raw).toMatch(/User\s+bob/i);
-    expect(raw).toMatch(/Port\s+2222/i);
-    expect(raw).toMatch(/ProxyJump\s+bastion/);
-
-    const back = await readSshConfig(scratchFile);
-    expect(back).toMatchObject([
-      { id: 'foo', hostname: '10.0.0.2', user: 'bob', port: 2222 },
-    ]);
-  });
-
-  it('upserts when the host block does not exist on disk', async () => {
-    // Empty file → updateHostFields should fall back to upsertHost rather than throw.
-    await fs.writeFile(scratchFile, '');
-    await updateHostFields(host({ id: 'fresh', hostname: '10.0.0.9', user: 'me' }), scratchFile);
-    const back = await readSshConfig(scratchFile);
-    expect(back).toHaveLength(1);
-    expect(back[0].id).toBe('fresh');
-  });
-
-  it('toggles the auth marker so agent-pinned vs key is recoverable on re-read', async () => {
-    // First write as agent + pinned key.
-    await upsertHost(host({
-      id: 'foo',
-      hostname: '10.0.0.1',
-      user: 'alice',
-      authMethod: 'agent',
-      identityFile: '/home/alice/.ssh/id_ed25519.pub',
-    }), scratchFile);
-    let back = await readSshConfig(scratchFile);
-    expect(back[0].authMethod).toBe('agent');
-
-    // Toggle to key mode (same identityFile path on disk).
-    await updateHostFields(host({
-      id: 'foo',
-      hostname: '10.0.0.1',
-      user: 'alice',
       authMethod: 'key',
-      identityFile: '/home/alice/.ssh/id_ed25519',
-    }), scratchFile);
-    back = await readSshConfig(scratchFile);
-    expect(back[0].authMethod).toBe('key');
+      identityFile: '/tmp/lab.key',
+    }), managedConfig);
+
+    const raw = await fs.readFile(managedConfig, 'utf8');
+    expect(raw).toContain('ProxyJump bastion');
+    expect(raw).toContain('ServerAliveInterval 60');
+    expect(raw).toContain('HostName 192.0.2.31');
+    expect(raw).toContain('Port 2222');
+    expect(raw).toContain('# xdt-maker:auth=key');
+  });
+
+  it('preserves CRLF and permissions while updating a managed host', async () => {
+    await fs.writeFile(managedConfig, [
+      'Host lab',
+      '  HostName 192.0.2.40',
+      '  User alice',
+      '',
+    ].join('\r\n'), { mode: 0o640 });
+    await fs.chmod(managedConfig, 0o640);
+    const modeBefore = (await fs.stat(managedConfig)).mode & 0o777;
+
+    await updateManagedHostFields(host({
+      id: 'lab',
+      hostname: '192.0.2.41',
+      user: 'bob',
+      port: 2222,
+    }), managedConfig);
+
+    const raw = await fs.readFile(managedConfig, 'utf8');
+    expect(raw).toContain('HostName 192.0.2.41\r\n');
+    expect(raw).toContain('Port 2222\r\n');
+    expect(raw.replace(/\r\n/g, '')).not.toContain('\n');
+    if (modeBefore === 0o640) {
+      expect((await fs.stat(managedConfig)).mode & 0o777).toBe(modeBefore);
+    }
   });
 });
 
-// ── removeHost ───────────────────────────────────────────────────────────────
-
-describe('removeHost', () => {
-  it('removes a lowercase host block', async () => {
-    await fs.writeFile(scratchFile, [
-      'hOsT foo',
-      '  HoStNaMe 10.0.0.1',
-      '  User alice',
-      '',
-      'Host bar',
-      '  HostName 10.0.0.2',
-      '  User bob',
-      '',
-    ].join('\n'));
-
-    await removeHost('foo', scratchFile);
-
-    expect(await readSshConfig(scratchFile)).toMatchObject([
-      { id: 'bar', hostname: '10.0.0.2', user: 'bob' },
-    ]);
-  });
-
-  it('drops the named host block', async () => {
-    await upsertHost(host({ id: 'a' }), scratchFile);
-    await upsertHost(host({ id: 'b' }), scratchFile);
-    await removeHost('a', scratchFile);
-    const back = await readSshConfig(scratchFile);
-    expect(back.map(h => h.id)).toEqual(['b']);
-  });
-
-  it('is a no-op when the host is absent', async () => {
-    await upsertHost(host({ id: 'a' }), scratchFile);
-    await removeHost('nonexistent', scratchFile);
-    const back = await readSshConfig(scratchFile);
-    expect(back.map(h => h.id)).toEqual(['a']);
-  });
-
-  it('is a no-op when the file is missing entirely', async () => {
-    // No setup — file doesn't exist.
-    await expect(removeHost('any', scratchFile)).resolves.not.toThrow();
+describe('expandHome', () => {
+  it('expands POSIX and Windows tilde forms', () => {
+    expect(expandHome('~/.ssh/id_ed25519')).toBe(path.join(os.homedir(), '.ssh', 'id_ed25519'));
+    expect(expandHome('~\\.ssh\\id_ed25519')).toBe(path.join(os.homedir(), '.ssh', 'id_ed25519'));
   });
 });

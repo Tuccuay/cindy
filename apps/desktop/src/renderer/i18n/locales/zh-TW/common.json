@@ -11,6 +11,7 @@
     "REMOTE_NATIVE_OAUTH_UNAVAILABLE": "未連線 Claude.ai 訂閱，請先連線或選擇閘道器模型",
     "DEVICE_LINK_DEVICE_UNRESPONSIVE": "目標裝置長時間無響應，請檢查遠端裝置後重試",
     "INTERNAL": "操作失敗，請稍後重試。",
+    "SSH_CONFIG_RELOAD_REQUIRED": "SSH 設定已儲存，但 Cindy 重新整理失敗。請重新載入 SSH 設定。",
     "REMOTE_WORKDIR_INVALID": "遠端專案目錄無效，請重新選擇專案目錄。",
     "REMOTE_WORKDIR_NOT_FOUND": "遠端專案目錄不存在，請重新選擇專案目錄。",
     "REMOTE_WORKDIR_NOT_DIRECTORY": "遠端專案路徑不是資料夾，請重新選擇專案目錄。",
@@ -158,6 +159,13 @@
       "title": "遠端機器",
       "footnote": "第一版僅支援 SSH 連線管理。在遠端執行 Agent 的能力將在後續版本中加入。",
       "viaAuth": "透過 {{label}} 認證",
+      "readOnlyFromSshConfig": "連線資訊來自 SSH 設定",
+      "configWarning": "部分 SSH 設定規則 Cindy 無法解析，主機列表或連線資訊可能與終端 SSH 不一致。",
+      "configDiagnostic": {
+        "io": "Cindy 無法讀取 SSH 設定。這裡仍顯示上次成功讀取的主機；請檢查檔案權限，然後重新載入。",
+        "syntax": "Cindy 無法解析 SSH 設定。這裡仍顯示上次成功讀取的主機；請修正設定，然後重新載入。",
+        "limit": "SSH 設定的巢狀層級過深或內容過大，Cindy 無法安全讀取。這裡仍顯示上次成功讀取的主機。"
+      },
       "empty": {
         "title": "還沒有遠端機器。",
         "hint": "點選\"新增\"註冊一臺，或點重新整理圖示從 ~/.ssh/config 匯入。"
@@ -189,7 +197,8 @@
       },
       "edit": {
         "title": "編輯 {{id}}",
-        "submit": "儲存修改"
+        "submit": "儲存修改",
+        "connectionFieldsReadOnly": "來自 SSH 設定的連線資訊在此為唯讀；顯示名稱、自動連線和 Agent Proxy 仍可修改。"
       },
       "keys": {
         "title": "配置 SSH 金鑰",
@@ -266,6 +275,8 @@
       "add": {
         "title": "新增一臺遠端機器",
         "alias": "別名",
+        "displayName": "顯示名稱",
+        "displayNamePlaceholder": "選填，僅在 Cindy 中顯示",
         "hostname": "主機名",
         "user": "使用者",
         "port": "埠",

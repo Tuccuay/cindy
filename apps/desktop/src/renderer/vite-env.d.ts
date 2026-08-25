@@ -3720,12 +3720,21 @@ interface ElectronAPI {
   };
 
   // ── Remote SSH (Phase A) ───────────────────────────────────────────────
-  // 连接管理 + ~/.ssh/config IO. host.config.id == ssh alias.
+  // 连接管理 + OpenSSH config 发现. host.config.id == ssh alias.
   remoteSsh: {
-    list: () => Promise<{ hosts: RemoteHostSnapshot[] }>;
-    reloadConfig: () => Promise<{ hosts: RemoteHostSnapshot[] }>;
+    list: () => Promise<{
+      hosts: RemoteHostSnapshot[];
+      warnings?: string[];
+      diagnostic?: { kind: 'io' | 'syntax' | 'limit' } | null;
+    }>;
+    reloadConfig: () => Promise<{
+      hosts: RemoteHostSnapshot[];
+      warnings?: string[];
+      diagnostic?: { kind: 'io' | 'syntax' | 'limit' } | null;
+    }>;
     add: (host: {
       id: string;
+      displayName?: string;
       hostname: string;
       port?: number;
       user: string;
@@ -3736,6 +3745,7 @@ interface ElectronAPI {
     }) => Promise<{ host: RemoteHostSnapshot }>;
     update: (host: {
       id: string;
+      displayName?: string;
       hostname: string;
       port?: number;
       user: string;

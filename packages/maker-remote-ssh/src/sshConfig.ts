@@ -1,47 +1,75 @@
 /**
- * SSH config IO — read/write ~/.ssh/config in OpenSSH format.
+ * OpenSSH config discovery plus Cindy's narrowly-owned config writer.
  *
- * Phase A surface:
- *   - readSshConfig(): list every concrete host (skipping wildcards
- *     like `Host *` or `Host foo*`).
- *   - upsertHost(): add or replace one host block. Preserves all
- *     other entries verbatim.
- *   - removeHost(): drop one host block. No-op if absent.
- *
- * We intentionally do NOT inherit / merge wildcard rules in readSshConfig
- * — the renderer wants concrete hosts to display; `ssh` itself will apply
- * wildcards when we eventually exec it. Concrete-host enumeration is the
- * "user-facing" set.
+ * Discovery intentionally implements only the subset Cindy consumes. Include
+ * is expanded at root scope and inside a pure `Host *` block. Other Host/Match
+ * scopes are conditional, so expanding them without evaluating OpenSSH's full
+ * matcher would invent aliases that `ssh <alias>` cannot actually see.
  */
 
+import { randomBytes } from 'node:crypto';
 import { promises as fs } from 'node:fs';
-import path from 'node:path';
 import os from 'node:os';
-import SSHConfig from 'ssh-config';
+import path from 'node:path';
+import SSHConfig, { glob as matchesHostPattern } from 'ssh-config';
 
 import type { HostConfig } from './types.js';
 
 const DEFAULT_PORT = 22;
+const MAX_INCLUDE_DEPTH = 16;
+const MAX_INCLUDE_FILES = 64;
+const MAX_INCLUDE_BYTES = 1024 * 1024;
+const AUTH_MARKER_PREFIX = '# xdt-maker:auth=';
 
-/** Resolve `~/.ssh/config` on the current OS. */
-export function defaultSshConfigPath(): string {
-  return path.join(os.homedir(), '.ssh', 'config');
+export interface SshConfigDiagnostic {
+  path: string;
+  kind: 'io' | 'syntax' | 'limit';
+  message: string;
+  recoveryHint: string;
 }
 
-/**
- * Expand a leading `~` (or `~/`, `~\`) to the user's home directory.
- *
- * Exported so the ADD/UPDATE IPC boundary can normalize `identityFile` the
- * same way the config-read path does — Node never expands `~`, so a literal
- * `~/.ssh/...` stored in the pool host config would fail `fs.readFile` /
- * ssh-add. The `~\` prefix normalizes backslashes to `/` (a no-op on Windows,
- * but required on POSIX where backslash is a filename character).
- */
-export function expandHome(p: string): string {
-  if (p === '~') return os.homedir();
-  if (p.startsWith('~/')) return path.join(os.homedir(), p.slice(2));
-  if (p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2).replace(/\\/g, '/'));
-  return p;
+export interface ReadSshConfigOptions {
+  /** Cindy-owned config file. Omit it to make every discovered host read-only. */
+  managedConfigPath?: string;
+}
+
+export interface ReadSshConfigResult {
+  hosts: HostConfig[];
+  diagnostic: SshConfigDiagnostic | null;
+  warnings: string[];
+}
+
+type AuthMarker = 'agent' | 'key';
+type Scope =
+  | { kind: 'root' }
+  | { kind: 'host'; declaration: HostDeclaration }
+  | { kind: 'match'; expression: string };
+
+interface HostDeclaration {
+  patterns: string[];
+  sourcePath: string;
+  physicalPath: string;
+  marker: AuthMarker | null;
+  order: number;
+}
+
+interface DirectiveRecord {
+  name: string;
+  value: string;
+  scope: Scope;
+  order: number;
+}
+
+interface WalkState {
+  rootDir: string;
+  managedComparable: string | null;
+  visited: Set<string>;
+  files: string[];
+  bytes: number;
+  declarations: HostDeclaration[];
+  directives: DirectiveRecord[];
+  warnings: string[];
+  order: number;
 }
 
 interface SshConfigSection {
@@ -49,368 +77,952 @@ interface SshConfigSection {
   before?: string;
   after?: string;
   param?: string;
-  /**
-   * Separator between key and value as the ssh-config serializer expects it
-   * (normally a single space). MUST be set on directive nodes we synthesize —
-   * omitting it makes `toString()` emit `KeyundefinedValue` and corrupts the
-   * file. See applyDirective insert path.
-   */
   separator?: string;
-  value?: string | string[];
-  /** Present on comment nodes (type=2). */
+  quoted?: boolean;
+  value?: string | SshConfigValueToken | Array<string | SshConfigValueToken>;
   content?: string;
   config?: SshConfigSection[];
 }
 
-/** ssh-config AST: type=1 = directive, type=2 = comment, type=3 = blank line. */
+interface SshConfigValueToken { val?: unknown }
+
 const SSH_CONFIG_DIRECTIVE_TYPE = 1;
 const SSH_CONFIG_COMMENT_TYPE = 2;
 
-/**
- * Marker comment inside a host block that records the user's auth-method
- * choice. Needed because both 'agent + pinned key' and 'key' modes write
- * the same `IdentityFile + IdentitiesOnly yes` directives — we'd lose the
- * distinction on re-read otherwise.
- *
- * Reads as plain `#` comment to OpenSSH (ignored). Absence of the marker
- * with an IdentityFile present means "legacy key-file host" — we preserve
- * that interpretation for backward compat with hosts added before this
- * marker was introduced.
- */
-const AUTH_MARKER_PREFIX = '# xdt-maker:auth=';
+export function defaultSshConfigPath(): string {
+  return path.join(os.homedir(), '.ssh', 'config');
+}
 
-function readAuthMarker(section: SshConfigSection): 'agent' | 'key' | null {
-  for (const child of section.config ?? []) {
-    if (child.type !== SSH_CONFIG_COMMENT_TYPE) continue;
-    const content = (child.content ?? '').trim();
-    if (content === `${AUTH_MARKER_PREFIX}agent`) return 'agent';
-    if (content === `${AUTH_MARKER_PREFIX}key`) return 'key';
+export function defaultManagedSshConfigPath(): string {
+  return path.join(os.homedir(), '.ssh', 'cindy.conf');
+}
+
+export function expandHome(value: string): string {
+  if (value === '~') return os.homedir();
+  if (value.startsWith('~/')) return path.join(os.homedir(), value.slice(2));
+  if (value.startsWith('~\\')) {
+    return path.join(os.homedir(), value.slice(2).replace(/\\/g, '/'));
   }
+  return value;
+}
+
+export async function readSshConfig(
+  filePath = defaultSshConfigPath(),
+  options: ReadSshConfigOptions = {},
+): Promise<HostConfig[]> {
+  const result = await readSshConfigDetailed(filePath, options);
+  if (result.diagnostic) throw new Error(result.diagnostic.message);
+  return result.hosts;
+}
+
+export async function readSshConfigDetailed(
+  filePath = defaultSshConfigPath(),
+  options: ReadSshConfigOptions = {},
+): Promise<ReadSshConfigResult> {
+  const absoluteMainPath = path.resolve(filePath);
+  const managedComparable = options.managedConfigPath
+    ? await comparablePath(options.managedConfigPath)
+    : null;
+  const state: WalkState = {
+    rootDir: path.dirname(absoluteMainPath),
+    managedComparable,
+    visited: new Set(),
+    files: [],
+    bytes: 0,
+    declarations: [],
+    directives: [],
+    warnings: [],
+    order: 0,
+  };
+
+  try {
+    await walkFile(absoluteMainPath, { kind: 'root' }, state, 0, false);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      const warnings = options.managedConfigPath && await pathExists(options.managedConfigPath)
+        ? ['Cindy\'s SSH host file exists but is not reachable through a supported Include.']
+        : [];
+      return { hosts: [], diagnostic: null, warnings };
+    }
+    return {
+      hosts: [],
+      diagnostic: toConfigDiagnostic(absoluteMainPath, error),
+      warnings: state.warnings,
+    };
+  }
+
+  if (options.managedConfigPath) {
+    const managedExists = await pathExists(options.managedConfigPath);
+    const reachedManaged = managedComparable
+      ? Array.from(state.visited).some((item) => pathsEqual(item, managedComparable))
+      : false;
+    if (managedExists && !reachedManaged) {
+      state.warnings.push('Cindy\'s SSH host file exists but is not reachable through a supported Include.');
+    }
+  }
+
+  return {
+    hosts: buildHosts(state, managedComparable),
+    diagnostic: null,
+    warnings: state.warnings,
+  };
+}
+
+async function walkFile(
+  filePath: string,
+  inheritedScope: Scope,
+  state: WalkState,
+  depth: number,
+  optional: boolean,
+): Promise<void> {
+  if (depth > MAX_INCLUDE_DEPTH) {
+    throw limitError(filePath, `Include nesting exceeds ${MAX_INCLUDE_DEPTH} levels`);
+  }
+
+  let physicalPath: string;
+  try {
+    physicalPath = await comparablePath(filePath);
+  } catch (error) {
+    if (optional && (error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (state.visited.has(physicalPath)) return;
+
+  let raw: string;
+  try {
+    raw = await fs.readFile(physicalPath, 'utf8');
+  } catch (error) {
+    if (optional && (error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (state.files.length >= MAX_INCLUDE_FILES) {
+    throw limitError(physicalPath, `Include file count exceeds ${MAX_INCLUDE_FILES}`);
+  }
+  const bytes = Buffer.byteLength(raw, 'utf8');
+  if (state.bytes + bytes > MAX_INCLUDE_BYTES) {
+    throw limitError(physicalPath, `expanded SSH config exceeds ${MAX_INCLUDE_BYTES} bytes`);
+  }
+
+  try {
+    SSHConfig.parse(raw);
+  } catch (error) {
+    const syntaxError = new Error(
+      `failed to parse SSH config: ${error instanceof Error ? error.message : String(error)}`,
+    ) as Error & { code?: string; path?: string };
+    syntaxError.code = 'SSH_CONFIG_SYNTAX';
+    syntaxError.path = physicalPath;
+    throw syntaxError;
+  }
+
+  state.visited.add(physicalPath);
+  state.files.push(physicalPath);
+  state.bytes += bytes;
+
+  let scope = inheritedScope;
+  const lines = raw.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? '';
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    if (trimmed.startsWith('#')) {
+      if (scope.kind === 'host' && scope.declaration.marker === null) {
+        const marker = parseAuthMarker(trimmed);
+        if (marker) scope.declaration.marker = marker;
+      }
+      continue;
+    }
+
+    const directive = parseDirectiveLine(trimmed);
+    if (!directive) continue;
+    const location = `${physicalPath}:${index + 1}`;
+
+    if (directive.keyword === 'host') {
+      const patterns = splitWords(directive.value);
+      const declaration: HostDeclaration = {
+        patterns,
+        sourcePath: filePath,
+        physicalPath,
+        marker: null,
+        order: state.order++,
+      };
+      state.declarations.push(declaration);
+      scope = { kind: 'host', declaration };
+      continue;
+    }
+
+    if (directive.keyword === 'match') {
+      scope = { kind: 'match', expression: directive.value };
+      state.warnings.push(`${location}: Match is not evaluated by Cindy.`);
+      continue;
+    }
+
+    if (directive.keyword === 'include') {
+      if (!isSupportedIncludeScope(scope)) {
+        state.warnings.push(`${location}: conditional Include was not expanded.`);
+        continue;
+      }
+      for (const patternValue of splitWords(directive.value)) {
+        const expanded = expandHome(patternValue);
+        const absolutePattern = path.isAbsolute(expanded)
+          ? expanded
+          : path.resolve(state.rootDir, expanded);
+        for (const includedPath of await globPaths(absolutePattern)) {
+          const includedComparable = await comparablePath(includedPath);
+          const repeatedManagedGlob = hasGlob(patternValue)
+            && state.managedComparable !== null
+            && state.visited.has(includedComparable)
+            && pathsEqual(includedComparable, state.managedComparable);
+          // The child starts in the parent's active scope. This local scope is
+          // deliberately restored when the recursive call returns.
+          await walkFile(includedPath, scope, state, depth + 1, true);
+          if (repeatedManagedGlob) {
+            state.warnings.push(
+              `${location}: Include glob reaches Cindy's SSH host file after it was already loaded.`,
+            );
+          }
+        }
+      }
+      continue;
+    }
+
+    if (isCanonicalizationDirective(directive.keyword)) {
+      state.warnings.push(`${location}: hostname canonicalization is not evaluated by Cindy.`);
+      continue;
+    }
+    if (scope.kind === 'match') continue;
+
+    const name = directive.keyword;
+    if (name === 'hostname' || name === 'user' || name === 'port' || name === 'identityfile') {
+      state.directives.push({
+        name,
+        value: firstWordOrRaw(directive.value),
+        scope,
+        order: state.order++,
+      });
+    }
+  }
+}
+
+function buildHosts(state: WalkState, managedComparable: string | null): HostConfig[] {
+  const aliases: string[] = [];
+  const seen = new Set<string>();
+  for (const declaration of state.declarations) {
+    for (const pattern of declaration.patterns) {
+      if (!isConcreteAlias(pattern) || seen.has(pattern)) continue;
+      seen.add(pattern);
+      aliases.push(pattern);
+    }
+  }
+
+  return aliases.map((alias) => {
+    const introducing = state.declarations.filter((declaration) =>
+      declaration.patterns.some((pattern) => pattern === alias));
+    const firstIntroducing = introducing[0];
+    const concreteIdentity = firstMatchingDirective(
+      state.directives,
+      alias,
+      'identityfile',
+      (scope) => scope.kind === 'host'
+        && scope.declaration.patterns.some((pattern) => pattern === alias),
+    );
+    const fallbackIdentity = firstMatchingDirective(
+      state.directives,
+      alias,
+      'identityfile',
+      (scope) => scope.kind === 'root'
+        || (scope.kind === 'host'
+          && !scope.declaration.patterns.some((pattern) => pattern === alias)),
+    );
+    // Cindy/ssh2 consumes one key rather than OpenSSH's accumulated key list.
+    // Prefer a key declared by the concrete Host alias; only then inherit the
+    // first matching root/wildcard key. The auth marker still belongs solely
+    // to the first concrete declaration that introduced the alias.
+    const marker = firstIntroducing?.marker ?? null;
+    // An explicit, unpinned agent marker must stay unfiltered. Inheriting a
+    // wildcard IdentityFile here would make credentials.ts wrap ssh-agent in a
+    // FilteredAgent for a key the user never selected.
+    const identityRaw = marker === 'agent' && concreteIdentity === undefined
+      ? undefined
+      : concreteIdentity ?? fallbackIdentity;
+    const authMethod = identityRaw ? marker ?? 'key' : 'agent';
+    const hostname = firstMatchingDirective(state.directives, alias, 'hostname') ?? alias;
+    const user = firstMatchingDirective(state.directives, alias, 'user')
+      ?? os.userInfo().username;
+    const port = parseIntSafe(firstMatchingDirective(state.directives, alias, 'port'), DEFAULT_PORT);
+
+    const uniquelyManaged = managedComparable !== null
+      && introducing.length === 1
+      && firstIntroducing?.patterns.length === 1
+      && pathsEqual(firstIntroducing.physicalPath, managedComparable);
+
+    return {
+      id: alias,
+      hostname,
+      port,
+      user,
+      authMethod,
+      identityFile: identityRaw
+        ? expandIdentityFile(identityRaw, state.rootDir)
+        : undefined,
+      source: 'ssh-config' as const,
+      managedByCindy: uniquelyManaged,
+    };
+  });
+}
+
+function firstMatchingDirective(
+  directives: DirectiveRecord[],
+  alias: string,
+  name: string,
+  scopeFilter: (scope: Scope) => boolean = () => true,
+): string | undefined {
+  return directives
+    .filter((directive) => directive.name === name
+      && scopeFilter(directive.scope)
+      && scopeMatches(directive.scope, alias))
+    .sort((a, b) => a.order - b.order)[0]?.value;
+}
+
+function scopeMatches(scope: Scope, alias: string): boolean {
+  if (scope.kind === 'root') return true;
+  if (scope.kind === 'match') return false;
+  try {
+    return matchesHostPattern(scope.declaration.patterns, alias);
+  } catch {
+    return false;
+  }
+}
+
+function isSupportedIncludeScope(scope: Scope): boolean {
+  return scope.kind === 'root'
+    || (scope.kind === 'host'
+      && scope.declaration.patterns.length === 1
+      && scope.declaration.patterns[0] === '*');
+}
+
+function parseDirectiveLine(line: string): { keyword: string; value: string } | null {
+  if (!line || line.startsWith('#')) return null;
+  const match = /^([^\s=#]+)(?:\s*=\s*|\s+)(.*)$/.exec(line);
+  if (match) return { keyword: match[1]!.toLowerCase(), value: match[2]!.trim() };
+  return { keyword: line.toLowerCase(), value: '' };
+}
+
+function splitWords(value: string): string[] {
+  const words: string[] = [];
+  let word = '';
+  let quote: '"' | "'" | null = null;
+  const push = (): void => {
+    if (!word) return;
+    words.push(word);
+    word = '';
+  };
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index]!;
+    if (quote) {
+      if (char === quote) quote = null;
+      else if (char === '\\'
+        && quote === '"'
+        && (value[index + 1] === '"' || value[index + 1] === '\\')) {
+        word += value[index + 1];
+        index += 1;
+      } else word += char;
+      continue;
+    }
+    if (char === '#') {
+      if (!word) break;
+      word += char;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      push();
+      continue;
+    }
+    if (char === '\\' && /[\s#'"\\]/.test(value[index + 1] ?? '')) {
+      word += value[index + 1];
+      index += 1;
+      continue;
+    }
+    word += char;
+  }
+  push();
+  return words;
+}
+
+function firstWordOrRaw(value: string): string {
+  return splitWords(value)[0] ?? value.trim();
+}
+
+function parseAuthMarker(comment: string): AuthMarker | null {
+  const normalized = comment.trim();
+  if (normalized === `${AUTH_MARKER_PREFIX}agent`) return 'agent';
+  if (normalized === `${AUTH_MARKER_PREFIX}key`) return 'key';
   return null;
+}
+
+function isCanonicalizationDirective(keyword: string): boolean {
+  return keyword.startsWith('canonicalize') || keyword === 'canonicaldomains';
+}
+
+function isConcreteAlias(alias: string): boolean {
+  return !!alias
+    && !alias.includes('*')
+    && !alias.includes('?')
+    && !alias.includes('[')
+    && !alias.startsWith('!');
+}
+
+function expandIdentityFile(value: string, configDir: string): string {
+  const expanded = expandHome(value);
+  return path.isAbsolute(expanded) ? expanded : path.resolve(configDir, expanded);
+}
+
+async function globPaths(pattern: string): Promise<string[]> {
+  const normalized = path.normalize(pattern);
+  const root = path.parse(normalized).root;
+  const segments = normalized.slice(root.length).split(path.sep).filter(Boolean);
+  const start = root || '.';
+
+  const walk = async (directory: string, index: number): Promise<string[]> => {
+    if (index >= segments.length) {
+      try {
+        const stat = await fs.stat(directory);
+        return stat.isFile() ? [directory] : [];
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT' || code === 'ENOTDIR') return [];
+        throw error;
+      }
+    }
+
+    const segment = segments[index]!;
+    if (!hasGlob(segment)) return walk(path.join(directory, segment), index + 1);
+
+    let entries: string[];
+    try {
+      entries = (await fs.readdir(directory)).sort((a, b) =>
+        Buffer.compare(Buffer.from(a), Buffer.from(b)));
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') return [];
+      throw error;
+    }
+
+    const matches: string[] = [];
+    for (const entry of entries) {
+      if (entry.startsWith('.') && !segment.startsWith('.')) continue;
+      if (path.matchesGlob(entry, segment)) {
+        matches.push(...await walk(path.join(directory, entry), index + 1));
+      }
+    }
+    return matches;
+  };
+
+  return walk(start, 0);
+}
+
+function hasGlob(value: string): boolean {
+  return /[*?\[]/.test(value);
+}
+
+/** Ensure the main config has one supported, canonical exact Include. */
+export async function ensureManagedConfigInclude(
+  mainConfigPath: string,
+  managedConfigPath: string,
+): Promise<void> {
+  const existing = await readRawConfig(mainConfigPath);
+  const eol = existing.includes('\r\n') ? '\r\n' : '\n';
+  const lines = splitLinesKeepingEndings(existing);
+  const kept: string[] = [];
+  const movedInlineComments: string[] = [];
+  let scope: 'root' | 'pure-star' | 'conditional' | 'match' = 'root';
+
+  for (const line of lines) {
+    const directive = parseDirectiveLine(line.trim());
+    if (directive?.keyword === 'host') {
+      const patterns = splitWords(directive.value);
+      scope = patterns.length === 1 && patterns[0] === '*' ? 'pure-star' : 'conditional';
+    } else if (directive?.keyword === 'match') {
+      scope = 'match';
+    }
+
+    const supported = scope === 'root' || scope === 'pure-star';
+    if (supported
+      && directive?.keyword === 'include'
+      && await isSingleExactInclude(
+        directive.value,
+        path.dirname(path.resolve(mainConfigPath)),
+        managedConfigPath,
+      )) {
+      const inlineComment = extractInlineComment(stripLineEnding(line));
+      if (inlineComment && !movedInlineComments.includes(inlineComment)) {
+        movedInlineComments.push(inlineComment);
+      }
+      continue;
+    }
+    kept.push(line);
+  }
+
+  let insertionIndex = 0;
+  while (insertionIndex < kept.length) {
+    const content = stripLineEnding(kept[insertionIndex]!).trim();
+    if (content === '' || content.startsWith('#')) insertionIndex += 1;
+    else break;
+  }
+  const [firstInlineComment, ...extraInlineComments] = movedInlineComments;
+  const includeLine = `Include ${formatIncludePath(managedConfigPath)}`
+    + `${firstInlineComment ? ` ${firstInlineComment}` : ''}${eol}`;
+  const preservedExtraComments = extraInlineComments.map((comment) => `${comment}${eol}`);
+  kept.splice(insertionIndex, 0, includeLine, ...preservedExtraComments);
+  if (insertionIndex > 0 && !/[\r\n]$/.test(kept[insertionIndex - 1]!)) {
+    kept[insertionIndex - 1] = `${kept[insertionIndex - 1]}${eol}`;
+  }
+  const next = kept.join('');
+  if (next !== existing) await writeAtomicPreservingTarget(mainConfigPath, next);
+}
+
+/** Append a new, single-alias Host block to Cindy's managed file. */
+export async function addManagedHost(host: HostConfig, managedConfigPath: string): Promise<void> {
+  const existing = await readRawConfig(managedConfigPath);
+  const next = prepareManagedHostAdd(host, existing);
+  await writeAtomicPreservingTarget(managedConfigPath, next);
+}
+
+/**
+ * Publish a new managed host without ever making a known-bad managed file
+ * reachable from the user's main SSH config.
+ */
+export async function addManagedHostWithInclude(
+  host: HostConfig,
+  mainConfigPath: string,
+  managedConfigPath: string,
+): Promise<void> {
+  const existing = await readRawConfig(managedConfigPath);
+  // Parse and serialize the complete next file before publishing either disk
+  // mutation. A malformed pre-existing cindy.conf therefore cannot be exposed
+  // by a newly inserted Include.
+  const next = prepareManagedHostAdd(host, existing);
+  await writeAtomicPreservingTarget(managedConfigPath, next);
+  try {
+    await ensureManagedConfigInclude(mainConfigPath, managedConfigPath);
+  } catch (includeError) {
+    // Roll back only if nobody changed the managed file after our atomic write.
+    // If it did change, preserving that external edit is safer; both versions
+    // are syntactically valid, so the main SSH graph is not poisoned.
+    try {
+      if (await readRawConfig(managedConfigPath) === next) {
+        await writeAtomicPreservingTarget(managedConfigPath, existing);
+      }
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [includeError, rollbackError],
+        'failed to publish managed SSH Include and roll back the staged host',
+      );
+    }
+    throw includeError;
+  }
+}
+
+/** Update only Cindy-owned connection fields and preserve all other directives. */
+export async function updateManagedHostFields(
+  host: HostConfig,
+  managedConfigPath: string,
+): Promise<void> {
+  const existing = await readRawConfig(managedConfigPath);
+  if (!existing) throw new Error(`managed SSH host not found: ${host.id}`);
+  const parsed = SSHConfig.parse(existing) as SshConfigSection[];
+  const section = findSingleHostSection(parsed, host.id);
+  if (!section?.config) throw new Error(`managed SSH host not found or ambiguous: ${host.id}`);
+  projectManagedFields(section, host, existing.includes('\r\n') ? '\r\n' : '\n');
+  await writeAtomicPreservingTarget(
+    managedConfigPath,
+    (parsed as unknown as { toString(): string }).toString(),
+  );
+}
+
+export async function removeManagedHost(alias: string, managedConfigPath: string): Promise<void> {
+  const existing = await readRawConfig(managedConfigPath);
+  if (!existing) return;
+  const parsed = SSHConfig.parse(existing) as SshConfigSection[];
+  const matches = parsed.filter((section) => isSingleAliasHostSection(section, alias));
+  if (matches.length !== 1) throw new Error(`managed SSH host not found or ambiguous: ${alias}`);
+  parsed.splice(parsed.indexOf(matches[0]!), 1);
+  await writeAtomicPreservingTarget(
+    managedConfigPath,
+    (parsed as unknown as { toString(): string }).toString(),
+  );
+}
+
+/** Legacy helpers retained for package callers/tests. Every path is required. */
+export async function upsertHost(host: HostConfig, filePath: string): Promise<void> {
+  const existing = await readRawConfig(filePath);
+  const parsed = SSHConfig.parse(existing) as SshConfigSection[];
+  removeHostSections(parsed, host.id);
+  const append = SSHConfig.parse(formatHostBlock(host, '\n')) as SshConfigSection[];
+  for (const node of append) (parsed as unknown as { push(node: unknown): void }).push(node);
+  await writeAtomicPreservingTarget(
+    filePath,
+    (parsed as unknown as { toString(): string }).toString(),
+  );
+}
+
+export async function updateHostFields(host: HostConfig, filePath: string): Promise<void> {
+  const existing = await readRawConfig(filePath);
+  if (!existing) return upsertHost(host, filePath);
+  const parsed = SSHConfig.parse(existing) as SshConfigSection[];
+  const section = findHostSection(parsed, host.id);
+  if (!section?.config) return upsertHost(host, filePath);
+  projectManagedFields(section, host, existing.includes('\r\n') ? '\r\n' : '\n');
+  await writeAtomicPreservingTarget(
+    filePath,
+    (parsed as unknown as { toString(): string }).toString(),
+  );
+}
+
+export async function removeHost(alias: string, filePath: string): Promise<void> {
+  const existing = await readRawConfig(filePath);
+  if (!existing) return;
+  const parsed = SSHConfig.parse(existing) as SshConfigSection[];
+  removeHostSections(parsed, alias);
+  await writeAtomicPreservingTarget(
+    filePath,
+    (parsed as unknown as { toString(): string }).toString(),
+  );
+}
+
+function projectManagedFields(section: SshConfigSection, host: HostConfig, eol: string): void {
+  const hasIdentity = !!host.identityFile;
+  const desired: Array<[string, string | null]> = [
+    ['HostName', host.hostname],
+    ['User', host.user],
+    ['Port', host.port && host.port !== DEFAULT_PORT ? String(host.port) : null],
+    ['IdentityFile', hasIdentity ? host.identityFile! : null],
+    ['IdentitiesOnly', hasIdentity ? 'yes' : null],
+  ];
+  for (const [name, value] of desired) applyDirective(section, name, value, eol);
+  // Always persist Cindy's auth choice. Without an agent marker, a managed
+  // host with no local IdentityFile would silently become key auth if it
+  // inherits an IdentityFile from an earlier Host * block.
+  applyAuthMarker(section, host.authMethod, eol);
+}
+
+function findAnyHostSection(parsed: SshConfigSection[], alias: string): SshConfigSection | null {
+  return parsed.find((section) => isHostDirective(section)
+    && directiveValues(section).includes(alias)) ?? null;
+}
+
+function findHostSection(parsed: SshConfigSection[], alias: string): SshConfigSection | null {
+  return findAnyHostSection(parsed, alias);
+}
+
+function findSingleHostSection(parsed: SshConfigSection[], alias: string): SshConfigSection | null {
+  const matches = parsed.filter((section) => isSingleAliasHostSection(section, alias));
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+function isSingleAliasHostSection(section: SshConfigSection, alias: string): boolean {
+  const values = directiveValues(section);
+  return isHostDirective(section) && values.length === 1 && values[0] === alias;
 }
 
 function isHostDirective(section: SshConfigSection): boolean {
   return section.param?.toLowerCase() === 'host';
 }
 
-/**
- * Read and parse ~/.ssh/config (or any path). Returns a list of concrete
- * hosts — wildcards and `Match` blocks are skipped. Missing file → [].
- */
-export async function readSshConfig(filePath = defaultSshConfigPath()): Promise<HostConfig[]> {
-  let raw: string;
-  try {
-    raw = await fs.readFile(filePath, 'utf8');
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
-    throw err;
+function directiveValues(section: SshConfigSection): string[] {
+  const raw = Array.isArray(section.value) ? section.value : [section.value];
+  const values: string[] = [];
+  for (const item of raw) {
+    if (typeof item === 'string') values.push(item);
+    else if (item && typeof item.val === 'string') values.push(item.val);
   }
-
-  const parsed = SSHConfig.parse(raw) as SshConfigSection[];
-  const hosts: HostConfig[] = [];
-
-  for (const section of parsed) {
-    if (!isHostDirective(section)) continue;
-    const aliases = Array.isArray(section.value) ? section.value : [section.value];
-    for (const aliasRaw of aliases) {
-      if (typeof aliasRaw !== 'string') continue;
-      const alias = aliasRaw.trim();
-      if (!alias || alias.includes('*') || alias.includes('?') || alias.startsWith('!')) continue;
-
-      // Pluck params out of this Host block (case-insensitive per spec).
-      const params = new Map<string, string>();
-      for (const child of section.config ?? []) {
-        if (!child.param || typeof child.value !== 'string') continue;
-        params.set(child.param.toLowerCase(), child.value);
-      }
-
-      const identityFile = params.get('identityfile');
-      // Auth-method rules:
-      //   IdentityFile absent → 'agent' (unfiltered, no key pin)
-      //   IdentityFile present + marker says agent → 'agent' + pinned key
-      //   IdentityFile present + marker says key → 'key'
-      //   IdentityFile present + no marker → 'key' (legacy host, backward compat)
-      const marker = readAuthMarker(section);
-      const authMethod: 'agent' | 'key' = identityFile
-        ? (marker === 'agent' ? 'agent' : 'key')
-        : 'agent';
-      hosts.push({
-        id: alias,
-        hostname: params.get('hostname') ?? alias,
-        port: parseIntSafe(params.get('port'), DEFAULT_PORT),
-        user: params.get('user') ?? os.userInfo().username,
-        authMethod,
-        identityFile: identityFile ? expandHome(identityFile) : undefined,
-        source: 'ssh-config',
-      });
-    }
-  }
-
-  return hosts;
+  return values;
 }
 
-/**
- * Add a NEW host block to ~/.ssh/config. If a block with the same alias
- * exists it's replaced wholesale (use `updateHostFields` for surgical edits
- * that preserve hand-written directives like ProxyJump / ServerAliveInterval).
- *
- * Atomic write via temp file. Creates the dir + file with strict perms
- * when missing.
- */
-export async function upsertHost(
-  host: HostConfig,
-  filePath = defaultSshConfigPath(),
-): Promise<void> {
-  const existing = await readRawConfig(filePath);
-  const parsed = SSHConfig.parse(existing) as SshConfigSection[];
-
-  // Remove the complete block before appending the replacement. The ssh-config
-  // library's `remove({ Host: alias })` matcher is case-sensitive on the
-  // directive name, while OpenSSH treats keywords case-insensitively.
-  removeHostSections(parsed, host.id);
-
-  const append = SSHConfig.parse(formatHostBlock(host)) as SshConfigSection[];
-  for (const node of append) {
-    (parsed as unknown as { push(node: unknown): void }).push(node);
-  }
-
-  const out = (parsed as unknown as { toString(): string }).toString();
-  await writeAtomic(filePath, out);
-}
-
-/** Remove all concrete Host blocks for an alias, regardless of keyword casing. */
 function removeHostSections(parsed: SshConfigSection[], alias: string): void {
   for (let index = parsed.length - 1; index >= 0; index -= 1) {
-    const section = parsed[index];
-    if (!isHostDirective(section)) continue;
-    const values = Array.isArray(section.value) ? section.value : [section.value];
-    if (values.includes(alias)) parsed.splice(index, 1);
+    if (isHostDirective(parsed[index]!) && directiveValues(parsed[index]!).includes(alias)) {
+      parsed.splice(index, 1);
+    }
   }
 }
 
-/**
- * Surgically update only the fields we own (HostName / User / Port /
- * IdentityFile / IdentitiesOnly) inside an existing host block, leaving
- * everything else (ProxyJump / ServerAliveInterval / Tag / comments / ...)
- * exactly as the user wrote them.
- *
- * Falls back to `upsertHost` if the host block doesn't exist on disk
- * (e.g. user removed it manually since we last hydrated).
- *
- * Updating an already-set directive mutates its `.value` in place — the
- * surrounding whitespace / comments are preserved by ssh-config's
- * `.toString()` serializer.
- *
- * Adding a new directive (e.g. switching from agent to key requires
- * inserting `IdentityFile`) appends to the block's nested config array
- * with synthesized whitespace that matches OpenSSH's convention (2-space
- * indent + trailing newline).
- *
- * Removing a directive (e.g. switching from key back to agent should drop
- * `IdentityFile` and `IdentitiesOnly`) is a `.filter` on the block's
- * nested config array.
- */
-export async function updateHostFields(
-  host: HostConfig,
-  filePath = defaultSshConfigPath(),
-): Promise<void> {
-  const existing = await readRawConfig(filePath);
-  if (!existing) {
-    return upsertHost(host, filePath);
-  }
-  const parsed = SSHConfig.parse(existing) as SshConfigSection[];
-
-  const section = findHostSection(parsed, host.id);
-  if (!section || !section.config) {
-    // Block disappeared since we hydrated — recreate it cleanly. Caller's
-    // pool will end up consistent with disk on next hydrate.
-    return upsertHost(host, filePath);
-  }
-
-  // Build the (param, value-or-null) directives we want to project onto
-  // the existing block. `null` = remove the directive entirely; a value
-  // = set / replace.
-  // Both auth modes can carry an identityFile:
-  //   key   → identityFile is the private key we read directly (no agent).
-  //   agent → identityFile is the public key we filter the agent down to.
-  // In both cases we want OpenSSH CLI to mirror the behaviour — that means
-  // IdentityFile + IdentitiesOnly yes so a terminal `ssh <alias>` doesn't
-  // enumerate every agent key and trip MaxAuthTries.
-  const hasPinnedKey = !!host.identityFile;
-  const desired: Array<[string, string | null]> = [
-    ['HostName', host.hostname],
-    ['User', host.user],
-    ['Port', host.port && host.port !== DEFAULT_PORT ? String(host.port) : null],
-    ['IdentityFile', hasPinnedKey ? host.identityFile! : null],
-    ['IdentitiesOnly', hasPinnedKey ? 'yes' : null],
-  ];
-
-  for (const [param, value] of desired) {
-    applyDirective(section, param, value);
-  }
-  // Marker comment lives alongside the directives. Set/clear it based on
-  // the post-edit auth method so we recover the choice on next read.
-  applyAuthMarker(section, hasPinnedKey ? host.authMethod : null);
-
-  const out = (parsed as unknown as { toString(): string }).toString();
-  await writeAtomic(filePath, out);
-}
-
-/** Find a Host section whose value list contains exactly `alias`. */
-function findHostSection(
-  parsed: SshConfigSection[],
-  alias: string,
-): SshConfigSection | null {
-  for (const section of parsed) {
-    if (!isHostDirective(section)) continue;
-    const values = Array.isArray(section.value) ? section.value : [section.value];
-    if (values.includes(alias)) return section;
-  }
-  return null;
-}
-
-/**
- * Within a Host block's nested directive list, either:
- *  - set the named directive's value (mutates first matching entry, drops
- *    any duplicate matches — multiple `IdentityFile` lines collapse to one,
- *    which is the right behavior for our managed fields), OR
- *  - remove all matching directives entirely if `value === null`.
- *
- * Matches are case-insensitive (SSH config keys are).
- */
 function applyDirective(
   section: SshConfigSection,
   param: string,
   value: string | null,
+  eol: string,
 ): void {
   const children = section.config ?? [];
-  const lowerParam = param.toLowerCase();
-
+  const wanted = param.toLowerCase();
   if (value === null) {
-    section.config = children.filter(
-      (c) => !c.param || c.param.toLowerCase() !== lowerParam,
-    );
+    section.config = children.filter((child) => child.param?.toLowerCase() !== wanted);
     return;
   }
-
-  let matched = false;
+  const serialized = serializeSshValue(value);
+  let found = false;
   const next: SshConfigSection[] = [];
   for (const child of children) {
-    if (child.param && child.param.toLowerCase() === lowerParam) {
-      if (matched) continue; // drop dupes — only keep the first
-      matched = true;
-      child.value = value;
-      next.push(child);
-    } else {
-      next.push(child);
+    if (child.param?.toLowerCase() === wanted) {
+      if (found) continue;
+      child.value = serialized.value;
+      child.quoted = serialized.quoted || undefined;
+      found = true;
     }
+    next.push(child);
   }
-  if (!matched) {
-    // Insert a fresh directive at the end of the block. Whitespace matches
-    // the rest of the block — 2-space indent + trailing newline is the
-    // OpenSSH convention `formatHostBlock` also emits.
+  if (!found) {
     next.push({
       type: SSH_CONFIG_DIRECTIVE_TYPE,
       before: '  ',
-      after: '\n',
+      after: eol,
       param,
-      // Without a separator the serializer emits `<param>undefined<value>`,
-      // producing an unparseable directive that corrupts ~/.ssh/config.
       separator: ' ',
-      value,
+      value: serialized.value,
+      quoted: serialized.quoted || undefined,
     });
   }
   section.config = next;
 }
 
-/**
- * Set/clear the `# xdt-maker:auth=...` marker comment inside a host block.
- *
- * Called from `updateHostFields` so the round-trip preserves the user's
- * choice between 'agent + pinned key' and 'key' modes (both share the
- * same `IdentityFile + IdentitiesOnly yes` directives on disk).
- *
- * Passing `method = null` removes any existing marker (used when the
- * directives that warrant it are themselves being removed).
- */
 function applyAuthMarker(
   section: SshConfigSection,
-  method: 'agent' | 'key' | null,
+  method: AuthMarker,
+  eol: string,
 ): void {
   const children = section.config ?? [];
-  // Drop any existing marker first — handles toggling between agent/key
-  // as well as the clear-on-removal case.
-  const cleaned = children.filter((c) => {
-    if (c.type !== SSH_CONFIG_COMMENT_TYPE) return true;
-    const content = (c.content ?? '').trim();
-    return !content.startsWith(AUTH_MARKER_PREFIX);
-  });
-  if (method === null) {
-    section.config = cleaned;
-    return;
-  }
-  cleaned.push({
+  const next = children.filter((child) => !(child.type === SSH_CONFIG_COMMENT_TYPE
+    && (child.content ?? '').trim().startsWith(AUTH_MARKER_PREFIX)));
+  const identityIndex = next.findIndex((child) => child.param?.toLowerCase() === 'identityfile');
+  const marker: SshConfigSection = {
     type: SSH_CONFIG_COMMENT_TYPE,
     before: '  ',
-    after: '\n',
+    after: eol,
     content: `${AUTH_MARKER_PREFIX}${method}`,
-  });
-  section.config = cleaned;
+  };
+  next.splice(identityIndex >= 0 ? identityIndex : next.length, 0, marker);
+  section.config = next;
 }
 
-/** Drop a host block. No-op if absent. */
-export async function removeHost(
-  alias: string,
-  filePath = defaultSshConfigPath(),
-): Promise<void> {
-  const existing = await readRawConfig(filePath);
-  if (!existing) return;
+function formatHostBlock(host: HostConfig, eol: string): string {
+  assertManagedAlias(host.id);
+  const parsed = SSHConfig.parse(
+    `Host ${formatSshArgument(host.id)}${eol}`,
+  ) as SshConfigSection[];
+  const section = parsed[0];
+  if (!section) throw new Error(`failed to construct managed SSH host: ${host.id}`);
+  projectManagedFields(section, host, eol);
+  return (parsed as unknown as { toString(): string }).toString();
+}
+
+function prepareManagedHostAdd(host: HostConfig, existing: string): string {
   const parsed = SSHConfig.parse(existing) as SshConfigSection[];
-  removeHostSections(parsed, alias);
-  await writeAtomic(filePath, (parsed as unknown as { toString(): string }).toString());
+  if (findAnyHostSection(parsed, host.id)) {
+    throw new Error(`host already exists in managed SSH config: ${host.id}`);
+  }
+  const eol = existing.includes('\r\n') ? '\r\n' : '\n';
+  const separator = existing && !existing.endsWith('\n') && !existing.endsWith('\r') ? eol : '';
+  const next = `${existing}${separator}${formatHostBlock(host, eol)}`;
+  // The package parser is also the syntax gate used by discovery. Reparse the
+  // exact bytes that will be written so escaping changes cannot publish an
+  // unreadable managed file.
+  SSHConfig.parse(next);
+  return next;
 }
 
-// ── internals ──────────────────────────────────────────────────────────────
+async function isSingleExactInclude(
+  value: string,
+  configDir: string,
+  managedConfigPath: string,
+): Promise<boolean> {
+  const patterns = splitWords(value);
+  if (patterns.length !== 1 || hasGlob(patterns[0]!)) return false;
+  const expanded = expandHome(patterns[0]!);
+  const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(configDir, expanded);
+  return pathsEqual(await comparablePath(resolved), await comparablePath(managedConfigPath));
+}
+
+function formatIncludePath(managedConfigPath: string): string {
+  const absolute = path.resolve(managedConfigPath);
+  const defaultPath = path.resolve(defaultManagedSshConfigPath());
+  const value = pathsEqual(absolute, defaultPath) ? '~/.ssh/cindy.conf' : absolute;
+  return formatSshArgument(value);
+}
+
+function serializeSshValue(value: string): { value: string; quoted: boolean } {
+  assertSafeSshValue(value);
+  const quoted = value === '' || value.startsWith('#') || /[\s"\\]/.test(value);
+  return {
+    value: quoted
+      ? value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+      : value,
+    quoted,
+  };
+}
+
+function formatSshArgument(value: string): string {
+  const serialized = serializeSshValue(value);
+  return serialized.quoted ? `"${serialized.value}"` : serialized.value;
+}
+
+function assertSafeSshValue(value: string): void {
+  if (/[\0\r\n]/.test(value)) {
+    throw new Error('SSH config values must not contain NUL or line breaks');
+  }
+}
+
+function assertManagedAlias(alias: string): void {
+  assertSafeSshValue(alias);
+  if (!alias
+    || /\s/.test(alias)
+    || alias.includes('*')
+    || alias.includes('?')
+    || alias.includes('[')
+    || alias.startsWith('!')) {
+    throw new Error(`invalid managed SSH alias: ${alias}`);
+  }
+}
+
+function splitLinesKeepingEndings(value: string): string[] {
+  if (!value) return [];
+  return value.match(/.*(?:\r\n|\n|\r|$)/g)?.filter(Boolean) ?? [];
+}
+
+function stripLineEnding(value: string): string {
+  return value.replace(/[\r\n]+$/, '');
+}
+
+/** Return an OpenSSH inline comment; token-internal `#` is ordinary text. */
+function extractInlineComment(line: string): string | null {
+  let quote: '"' | "'" | null = null;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index]!;
+    if (quote) {
+      if (char === quote) quote = null;
+      else if (char === '\\' && quote === '"') index += 1;
+      continue;
+    }
+    if (char === '\\') {
+      index += 1;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === '#' && (index === 0 || /\s/.test(line[index - 1]!))) {
+      return line.slice(index).trimEnd();
+    }
+  }
+  return null;
+}
 
 async function readRawConfig(filePath: string): Promise<string> {
   try {
     return await fs.readFile(filePath, 'utf8');
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return '';
-    throw err;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
+    throw error;
   }
 }
 
-async function writeAtomic(filePath: string, content: string): Promise<void> {
-  await fs.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  const tmp = `${filePath}.maker.tmp`;
-  await fs.writeFile(tmp, content, { mode: 0o600 });
-  await fs.rename(tmp, filePath);
+async function writeAtomicPreservingTarget(filePath: string, content: string): Promise<void> {
+  const requested = path.resolve(filePath);
+  let target = requested;
+  let existingMode: number | undefined;
+  try {
+    const lstat = await fs.lstat(requested);
+    if (lstat.isSymbolicLink()) target = await fs.realpath(requested);
+    const stat = await fs.stat(target);
+    existingMode = stat.mode & 0o777;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    let requestedIsSymlink = false;
+    try {
+      const lstat = await fs.lstat(requested);
+      requestedIsSymlink = lstat.isSymbolicLink();
+    } catch (lstatError) {
+      if ((lstatError as NodeJS.ErrnoException).code !== 'ENOENT') throw lstatError;
+    }
+    if (requestedIsSymlink) throw error;
+  }
+
+  await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+  const tempPath = path.join(
+    path.dirname(target),
+    `.${path.basename(target)}.cindy-${process.pid}-${randomBytes(6).toString('hex')}`,
+  );
+  try {
+    await fs.writeFile(tempPath, content, { flag: 'wx', mode: existingMode ?? 0o600 });
+    if (existingMode !== undefined) await fs.chmod(tempPath, existingMode);
+    await fs.rename(tempPath, target);
+  } catch (error) {
+    await fs.unlink(tempPath).catch(() => undefined);
+    throw error;
+  }
 }
 
-function formatHostBlock(host: HostConfig): string {
-  const lines = [
-    `Host ${host.id}`,
-    `  HostName ${host.hostname}`,
-    `  User ${host.user}`,
-  ];
-  if (host.port && host.port !== DEFAULT_PORT) lines.push(`  Port ${host.port}`);
-  // identityFile is meaningful for BOTH auth methods (private key for 'key',
-  // public key fingerprint source for 'agent' pin). Either way, pair it with
-  // IdentitiesOnly yes so terminal `ssh <alias>` doesn't enumerate every
-  // agent key and trigger MaxAuthTries. We also stamp an `# xdt-maker:auth=`
-  // marker so on re-read we can distinguish 'agent + pinned' from 'key'.
-  if (host.identityFile) {
-    lines.push(`  ${AUTH_MARKER_PREFIX}${host.authMethod}`);
-    lines.push(`  IdentityFile ${host.identityFile}`);
-    lines.push('  IdentitiesOnly yes');
+async function comparablePath(value: string): Promise<string> {
+  const absolute = path.resolve(expandHome(value));
+  let comparable = absolute;
+  try {
+    comparable = await fs.realpath(absolute);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
-  // Leading blank line keeps blocks visually separated; trailing newline ends the block.
-  return `\n${lines.join('\n')}\n`;
+  comparable = path.normalize(comparable);
+  return process.platform === 'win32' ? comparable.toLowerCase() : comparable;
+}
+
+function pathsEqual(left: string, right: string): boolean {
+  return process.platform === 'win32'
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right;
+}
+
+async function pathExists(value: string): Promise<boolean> {
+  try {
+    await fs.access(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function parseIntSafe(value: string | undefined, fallback: number): number {
   if (!value) return fallback;
-  const n = parseInt(value, 10);
-  return Number.isFinite(n) ? n : fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function limitError(pathName: string, message: string): Error & { code: string; path: string } {
+  const error = new Error(message) as Error & { code: string; path: string };
+  error.code = 'SSH_CONFIG_LIMIT';
+  error.path = pathName;
+  return error;
+}
+
+function toConfigDiagnostic(filePath: string, error: unknown): SshConfigDiagnostic {
+  const code = (error as { code?: string }).code;
+  const kind: SshConfigDiagnostic['kind'] = code === 'SSH_CONFIG_LIMIT'
+    ? 'limit'
+    : code === 'SSH_CONFIG_SYNTAX'
+      ? 'syntax'
+      : 'io';
+  return {
+    path: typeof (error as { path?: unknown }).path === 'string'
+      ? (error as { path: string }).path
+      : filePath,
+    kind,
+    message: error instanceof Error ? error.message : String(error),
+    recoveryHint: kind === 'syntax'
+      ? 'Fix the SSH config syntax, then refresh.'
+      : kind === 'limit'
+        ? 'Reduce Include nesting, file count, or config size, then refresh.'
+        : 'Check SSH config permissions and Include paths, then refresh.',
+  };
 }

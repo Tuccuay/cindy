@@ -11,6 +11,7 @@
     "REMOTE_NATIVE_OAUTH_UNAVAILABLE": "未连接 Claude.ai 订阅，请先连接或选择网关模型",
     "DEVICE_LINK_DEVICE_UNRESPONSIVE": "目标设备长时间无响应，请检查远程设备后重试",
     "INTERNAL": "操作失败，请稍后重试。",
+    "SSH_CONFIG_RELOAD_REQUIRED": "SSH 配置已保存，但 Cindy 刷新失败。请重新加载 SSH 配置。",
     "REMOTE_WORKDIR_INVALID": "远程项目目录无效，请重新选择项目目录。",
     "REMOTE_WORKDIR_NOT_FOUND": "远程项目目录不存在，请重新选择项目目录。",
     "REMOTE_WORKDIR_NOT_DIRECTORY": "远程项目路径不是文件夹，请重新选择项目目录。",
@@ -158,6 +159,13 @@
       "title": "远端机器",
       "footnote": "第一版仅支持 SSH 连接管理。在远端运行 Agent 的能力将在后续版本中加入。",
       "viaAuth": "通过 {{label}} 认证",
+      "readOnlyFromSshConfig": "连接信息来自 SSH 配置",
+      "configWarning": "部分 SSH 配置规则 Cindy 无法解析，主机列表或连接信息可能与终端 SSH 不一致。",
+      "configDiagnostic": {
+        "io": "Cindy 无法读取 SSH 配置。这里仍显示上次成功读取的主机；请检查文件权限，然后重新加载。",
+        "syntax": "Cindy 无法解析 SSH 配置。这里仍显示上次成功读取的主机；请修复配置，然后重新加载。",
+        "limit": "SSH 配置的嵌套过深或内容过大，Cindy 无法安全读取。这里仍显示上次成功读取的主机。"
+      },
       "empty": {
         "title": "还没有远端机器。",
         "hint": "点击\"添加\"注册一台，或点刷新图标从 ~/.ssh/config 导入。"
@@ -189,7 +197,8 @@
       },
       "edit": {
         "title": "编辑 {{id}}",
-        "submit": "保存修改"
+        "submit": "保存修改",
+        "connectionFieldsReadOnly": "来自 SSH 配置的连接信息在这里为只读；显示名、自动连接和 Agent Proxy 仍可修改。"
       },
       "keys": {
         "title": "配置 SSH 密钥",
@@ -266,6 +275,8 @@
       "add": {
         "title": "添加一台远端机器",
         "alias": "别名",
+        "displayName": "显示名",
+        "displayNamePlaceholder": "可选，仅在 Cindy 中显示",
         "hostname": "主机名",
         "user": "用户",
         "port": "端口",

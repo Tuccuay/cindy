@@ -51,6 +51,7 @@ const HOST_CONFIG: HostConfig = {
   authMethod: 'key',
   identityFile: String.raw`C:\Users\someone\.ssh\id_ed25519`,
   source: 'manual',
+  managedByCindy: false,
 };
 
 const noopLogger = {

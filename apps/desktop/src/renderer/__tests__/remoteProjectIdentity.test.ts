@@ -19,6 +19,7 @@ function sshHost(
       user: 'alice',
       authMethod: 'agent',
       source: 'ssh-config',
+      managedByCindy: false,
       ...overrides,
     },
     status: 'ready',
@@ -51,6 +52,13 @@ describe('resolveRemoteProjectMachineIdentity', () => {
       sshHost('gpu-box', { hostname: 'example.test', port: 2202, user: 'root' }),
     ]);
     expect(identity?.displayLabel).toBe('gpu-box · root@example.test:2202');
+  });
+
+  it('shows a custom display name while retaining the SSH alias', () => {
+    const identity = resolveRemoteProjectMachineIdentity(remoteProject, [
+      sshHost('gpu-box', { displayName: 'Build box' }),
+    ]);
+    expect(identity?.displayLabel).toBe('Build box (gpu-box) · alice@10.0.0.8');
   });
 
   it('falls back to the persisted remoteHostId when config is missing', () => {

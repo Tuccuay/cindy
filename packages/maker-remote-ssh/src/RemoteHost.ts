@@ -340,6 +340,12 @@ export class RemoteHost {
   private client: Client | null = null;
   private reconnectAttempts = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  /**
+   * Monotonic connection-attempt generation. disconnect() advances it before
+   * ending the current client, so an async resolveAuth() or late ssh2 event
+   * from the previous endpoint cannot publish status or resurrect a session.
+   */
+  private connectionEpoch = 0;
   /** true = user explicitly asked to disconnect; suppress auto-reconnect. */
   private userDisconnected = false;
   private events = new EventEmitter();
@@ -439,6 +445,7 @@ export class RemoteHost {
    */
   async disconnect(): Promise<void> {
     this.userDisconnected = true;
+    this.connectionEpoch += 1;
     this.clearReconnectTimer();
     this.markForwardsDisarmed();
     if (this.client) {
@@ -1132,6 +1139,9 @@ export class RemoteHost {
   }
 
   private async doConnect(): Promise<void> {
+    const attemptEpoch = ++this.connectionEpoch;
+    const isCurrentAttempt = (): boolean => attemptEpoch === this.connectionEpoch;
+    const cancelledError = (): Error => new Error('SSH connection attempt cancelled');
     this.setStatus('connecting');
     this.hostKeyError = null;
     this.lastAuthError = null;
@@ -1140,6 +1150,7 @@ export class RemoteHost {
     try {
       auth = await resolveAuth(this.cfg);
     } catch (err) {
+      if (!isCurrentAttempt()) throw cancelledError();
       const msg = (err as Error).message;
       this.lastError = msg;
       // Keep the full error so concurrent connect() joiners can rethrow it
@@ -1148,6 +1159,10 @@ export class RemoteHost {
       this.setStatus('failed');
       throw err;
     }
+
+    // disconnect() may have run while local credentials were being resolved.
+    // Do not create an ssh2 client after that cancellation boundary.
+    if (!isCurrentAttempt()) throw cancelledError();
 
     const client = new Client();
     this.client = client;
@@ -1161,7 +1176,10 @@ export class RemoteHost {
       keepaliveCountMax: KEEPALIVE_COUNT_MAX,
       // TOFU host key check — without this ssh2 trusts any presented key (MITM).
       hostVerifier: (hostKey: Buffer, verify: (valid: boolean) => void): void => {
-        void this.verifyHostKey(hostKey).then(verify, () => verify(false));
+        void this.verifyHostKey(hostKey).then(
+          (valid) => verify(isCurrentAttempt() ? valid : false),
+          () => verify(false),
+        );
       },
       ...(auth.agent ? { agent: auth.agent } : {}),
       ...(auth.privateKey ? { privateKey: auth.privateKey } : {}),
@@ -1180,6 +1198,12 @@ export class RemoteHost {
 
       const onReady = () => {
         if (settled) return;
+        if (!isCurrentAttempt()) {
+          settled = true;
+          try { client.end(); } catch { /* stale client is already closing */ }
+          reject(cancelledError());
+          return;
+        }
         settled = true;
         this.lastError = undefined;
         this.lastAuthLabel = auth.label;
@@ -1193,6 +1217,13 @@ export class RemoteHost {
       };
 
       const onError = (err: Error) => {
+        if (!isCurrentAttempt()) {
+          if (!settled) {
+            settled = true;
+            reject(cancelledError());
+          }
+          return;
+        }
         if (settled) {
           // Post-ready error — feed into reconnect path, not the connect promise.
           this.handlePostReadyError(err);
@@ -1221,6 +1252,13 @@ export class RemoteHost {
       };
 
       const onClose = () => {
+        if (!isCurrentAttempt()) {
+          if (!settled) {
+            settled = true;
+            reject(cancelledError());
+          }
+          return;
+        }
         if (!settled) {
           settled = true;
           const msg = this.lastError ?? 'connection closed before ready';
@@ -1237,7 +1275,9 @@ export class RemoteHost {
       // ssh2 emits 'handshake' before 'ready' — repurpose to advance state
       // so renderer can show "authenticating" instead of staying on
       // "connecting" throughout auth.
-      client.on('handshake', () => this.setStatus('authenticating'));
+      client.on('handshake', () => {
+        if (isCurrentAttempt()) this.setStatus('authenticating');
+      });
       client.on('ready', onReady);
       client.on('error', onError);
       client.on('close', onClose);
@@ -1301,7 +1341,8 @@ export class RemoteHost {
       void this.doConnect().catch((err) => {
         // doConnect already set status=failed and recorded lastError.
         // If we still have attempts left, schedule again.
-        if (this.reconnectAttempts < MAX_RECONNECT_ATTEMPTS && !this.userDisconnected) {
+        if (this.userDisconnected) return;
+        if (this.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
           this.scheduleReconnect();
         } else {
           this.log.error('ssh reconnect exhausted', { id: this.id, error: (err as Error).message });

@@ -25,6 +25,7 @@ function cfg(partial: Partial<HostConfig>): HostConfig {
     user: 'deploy',
     authMethod: 'agent',
     source: 'manual',
+    managedByCindy: false,
     ...partial,
   };
 }
