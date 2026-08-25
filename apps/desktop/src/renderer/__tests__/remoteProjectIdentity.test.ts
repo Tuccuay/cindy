@@ -21,6 +21,7 @@ function sshHost(
       source: 'ssh-config',
       managedByCindy: false,
       ...overrides,
+      identityFileConfigured: overrides.identityFileConfigured ?? false,
     },
     status: 'ready',
     statusChangedAt: 0,

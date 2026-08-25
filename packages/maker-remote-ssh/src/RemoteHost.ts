@@ -235,11 +235,16 @@ export function isAuthFailure(msg: string): boolean {
 export function authFailureHint(cfg: HostConfig): string {
   const portArg = cfg.port && cfg.port !== 22 ? `-p ${cfg.port} ` : '';
   if (cfg.authMethod === 'agent') {
+    const pinned = !!cfg.identityFile
+      || (cfg.sshAuthentication?.allowedAgentFingerprints?.length ?? 0) > 0;
+    if (pinned) {
+      return 'SSH agent has no key the remote accepts from the configured identity set. '
+        + 'Load the matching private key with `ssh-add`, then try again.';
+    }
     return `SSH agent has no key the remote accepts. Run \`ssh-copy-id ${portArg}${cfg.user}@${cfg.hostname}\` from your terminal to install your pubkey, or re-add this host with "Identity file" auth.`;
   }
   if (cfg.authMethod === 'key') {
-    const file = cfg.identityFile ?? '(unset)';
-    return `Identity file ${file} was rejected by the remote. Verify the file is the right key for ${cfg.user}@${cfg.hostname}, or run \`ssh-copy-id ${portArg}-i ${file}.pub ${cfg.user}@${cfg.hostname}\` to install it.`;
+    return `The configured identity file was rejected by the remote. Verify it is the right key for ${cfg.user}@${cfg.hostname}, or run \`ssh-copy-id ${portArg}-i <public-key-file> ${cfg.user}@${cfg.hostname}\` with its matching public key.`;
   }
   return `Authentication failed connecting as ${cfg.user}@${cfg.hostname}.`;
 }
@@ -1074,11 +1079,21 @@ export class RemoteHost {
    * onError maps to `hostKeyError`). Fails closed: a missing store or a read
    * error refuses the connect rather than trusting an unverified key.
    */
-  private async verifyHostKey(hostKey: Buffer): Promise<boolean> {
+  private async verifyHostKey(
+    hostKey: Buffer,
+    storeKey: string,
+    isCurrentAttempt: () => boolean,
+  ): Promise<boolean> {
+    // A cancelled client must not even touch the shared TOFU store. In
+    // particular, updateConfig() may already have published a new endpoint
+    // while the old ssh2 client delivers a late hostVerifier callback.
+    if (!isCurrentAttempt()) return false;
     const store = this.hostKeys;
     if (!store) {
-      this.hostKeyError =
-        'SSH host key verification is not configured; refusing to connect without it.';
+      if (isCurrentAttempt()) {
+        this.hostKeyError =
+          'SSH host key verification is not configured; refusing to connect without it.';
+      }
       this.log.error('ssh host key store missing — refusing connect', { id: this.id });
       return false;
     }
@@ -1086,36 +1101,43 @@ export class RemoteHost {
     // (e.g. removed a stale entry after a legitimate server re-key) sees the
     // update on reconnect without restarting the app.
     store.reload();
+    if (!isCurrentAttempt()) return false;
     const presented = hostKeyFingerprint(hostKey);
-    const storeKey = hostKeyId(this.cfg.hostname, this.cfg.port);
     let stored: string | null;
     try {
       stored = await store.get(storeKey);
     } catch (err) {
-      this.hostKeyError = `failed to read trusted host keys: ${(err as Error).message}`;
+      if (isCurrentAttempt()) {
+        this.hostKeyError = `failed to read trusted host keys: ${(err as Error).message}`;
+      }
       this.log.error('ssh known-hosts read failed — refusing connect', {
         id: this.id,
         error: (err as Error).message,
       });
       return false;
     }
+    if (!isCurrentAttempt()) return false;
 
     const decision = decideHostKey(stored, presented);
     if (decision === 'match') return true;
     if (decision === 'trust-new') {
+      if (!isCurrentAttempt()) return false;
       try {
-        await store.set(storeKey, presented);
+        await store.set(storeKey, presented, isCurrentAttempt);
       } catch (err) {
         // Cannot persist the trusted fingerprint — refuse the connection.
         // Proceeding without persistence means the next reconnect would
         // re-enter trust-new and silently accept any key, defeating TOFU.
-        this.hostKeyError = `failed to persist trusted host key: ${(err as Error).message}`;
+        if (isCurrentAttempt()) {
+          this.hostKeyError = `failed to persist trusted host key: ${(err as Error).message}`;
+        }
         this.log.error('ssh known-hosts write failed — refusing connect', {
           id: this.id,
           error: (err as Error).message,
         });
         return false;
       }
+      if (!isCurrentAttempt()) return false;
       this.log.info('ssh host key trusted on first use', {
         id: this.id,
         host: storeKey,
@@ -1124,11 +1146,13 @@ export class RemoteHost {
       return true;
     }
     // mismatch
-    this.hostKeyError =
-      `Remote host key for ${storeKey} changed (${presented}) and no longer matches the ` +
-      `previously trusted key. This can mean the server was reinstalled — or a ` +
-      `man-in-the-middle. Connection refused. If you trust the change, remove the stale ` +
-      `entry from maker's known hosts and reconnect.`;
+    if (isCurrentAttempt()) {
+      this.hostKeyError =
+        `Remote host key for ${storeKey} changed (${presented}) and no longer matches the ` +
+        `previously trusted key. This can mean the server was reinstalled — or a ` +
+        `man-in-the-middle. Connection refused. If you trust the change, remove the stale ` +
+        `entry from maker's known hosts and reconnect.`;
+    }
     this.log.error('ssh host key mismatch — refusing connect', {
       id: this.id,
       host: storeKey,
@@ -1142,13 +1166,34 @@ export class RemoteHost {
     const attemptEpoch = ++this.connectionEpoch;
     const isCurrentAttempt = (): boolean => attemptEpoch === this.connectionEpoch;
     const cancelledError = (): Error => new Error('SSH connection attempt cancelled');
+    const attemptConfig: HostConfig = {
+      ...this.cfg,
+      ...(this.cfg.sshAuthentication
+        ? {
+            sshAuthentication: {
+              ...this.cfg.sshAuthentication,
+              configuredIdentityFiles: [
+                ...this.cfg.sshAuthentication.configuredIdentityFiles,
+              ],
+              ...(this.cfg.sshAuthentication.allowedAgentFingerprints
+                ? {
+                    allowedAgentFingerprints: [
+                      ...this.cfg.sshAuthentication.allowedAgentFingerprints,
+                    ],
+                  }
+                : {}),
+            },
+          }
+        : {}),
+    };
+    const attemptHostKeyId = hostKeyId(attemptConfig.hostname, attemptConfig.port);
     this.setStatus('connecting');
     this.hostKeyError = null;
     this.lastAuthError = null;
 
     let auth;
     try {
-      auth = await resolveAuth(this.cfg);
+      auth = await resolveAuth(attemptConfig);
     } catch (err) {
       if (!isCurrentAttempt()) throw cancelledError();
       const msg = (err as Error).message;
@@ -1168,15 +1213,19 @@ export class RemoteHost {
     this.client = client;
 
     const connectConfig: ConnectConfig = {
-      host: this.cfg.hostname,
-      port: this.cfg.port,
-      username: this.cfg.user,
+      host: attemptConfig.hostname,
+      port: attemptConfig.port,
+      username: attemptConfig.user,
       readyTimeout: READY_TIMEOUT_MS,
       keepaliveInterval: KEEPALIVE_INTERVAL_MS,
       keepaliveCountMax: KEEPALIVE_COUNT_MAX,
       // TOFU host key check — without this ssh2 trusts any presented key (MITM).
       hostVerifier: (hostKey: Buffer, verify: (valid: boolean) => void): void => {
-        void this.verifyHostKey(hostKey).then(
+        if (!isCurrentAttempt()) {
+          verify(false);
+          return;
+        }
+        void this.verifyHostKey(hostKey, attemptHostKeyId, isCurrentAttempt).then(
           (valid) => verify(isCurrentAttempt() ? valid : false),
           () => verify(false),
         );
@@ -1188,8 +1237,8 @@ export class RemoteHost {
 
     this.log.debug('ssh connecting', {
       id: this.id,
-      hostname: this.cfg.hostname,
-      port: this.cfg.port,
+      hostname: attemptConfig.hostname,
+      port: attemptConfig.port,
       auth: auth.label,
     });
 
@@ -1238,7 +1287,7 @@ export class RemoteHost {
         this.lastError = this.hostKeyError
           ? this.hostKeyError
           : isAuthFailure(err.message)
-            ? authFailureHint(this.cfg)
+            ? authFailureHint(attemptConfig)
             : err.message;
         this.client = null;
         this.setStatus('failed');
@@ -1382,6 +1431,9 @@ export class RemoteHost {
 
   /** Wait until status leaves {connecting, authenticating}. */
   private waitForTerminal(): Promise<void> {
+    if (this.status !== 'connecting' && this.status !== 'authenticating') {
+      return Promise.resolve();
+    }
     return new Promise((resolve) => {
       const off = this.onStatus((snap) => {
         if (snap.status !== 'connecting' && snap.status !== 'authenticating') {

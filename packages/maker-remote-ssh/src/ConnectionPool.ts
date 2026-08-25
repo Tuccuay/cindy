@@ -17,6 +17,7 @@ import { EventEmitter } from 'node:events';
 
 import { RemoteHost, type RemoteHostDeps, type StatusListener } from './RemoteHost.js';
 import { FileHostKeyStore, type HostKeyStore } from './hostKeys.js';
+import { effectiveAuthenticationFingerprint } from './sshAuthentication.js';
 import type { HostConfig, HostSnapshot } from './types.js';
 
 export interface ConnectionPoolDeps {
@@ -149,6 +150,5 @@ function connectionFieldsChanged(left: HostConfig, right: HostConfig): boolean {
   return left.hostname !== right.hostname
     || left.port !== right.port
     || left.user !== right.user
-    || left.authMethod !== right.authMethod
-    || left.identityFile !== right.identityFile;
+    || effectiveAuthenticationFingerprint(left) !== effectiveAuthenticationFingerprint(right);
 }

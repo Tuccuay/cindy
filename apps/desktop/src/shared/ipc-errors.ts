@@ -76,6 +76,9 @@ export type IpcErrorCode =
   | 'SSH_AUTH_FAILED'
   | 'SSH_CONFIG_IO_FAILED'
   | 'SSH_CONFIG_RELOAD_REQUIRED'
+  | 'SSH_CONFIG_AUTH_UNSUPPORTED'
+  | 'SSH_AGENT_UNAVAILABLE'
+  | 'SSH_HOST_PREFS_WRITE_FAILED'
   | 'SSH_HOST_NOT_FOUND'
   // remote-ssh：配置的私钥文件在磁盘上不存在/不可读。与 SSH_CONNECT_FAILED 分开——
   // 这是本机路径问题（缺失 / ~ 未展开 / 路径被改写），不是网络或服务器错误，renderer
@@ -296,6 +299,9 @@ const IPC_ERROR_CODES: ReadonlySet<IpcErrorCode> = new Set<IpcErrorCode>([
   'SSH_AUTH_FAILED',
   'SSH_CONFIG_IO_FAILED',
   'SSH_CONFIG_RELOAD_REQUIRED',
+  'SSH_CONFIG_AUTH_UNSUPPORTED',
+  'SSH_AGENT_UNAVAILABLE',
+  'SSH_HOST_PREFS_WRITE_FAILED',
   'SSH_HOST_NOT_FOUND',
   'SSH_KEY_FILE_NOT_FOUND',
   'SSH_NOT_CONNECTED',

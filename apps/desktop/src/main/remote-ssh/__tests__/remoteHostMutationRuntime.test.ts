@@ -151,7 +151,7 @@ function handler(channel: string): (...args: any[]) => Promise<any> {
 
 let initialListResult: {
   hosts: unknown[];
-  warnings: string[];
+  warningCount: number;
   diagnostic: { kind: string } | null;
 };
 
@@ -180,9 +180,74 @@ describe('remote SSH mutation runtime semantics', () => {
   it('returns a cold-start diagnostic instead of making the host list look valid and empty', () => {
     expect(initialListResult).toMatchObject({
       hosts: [],
-      warnings: [],
+      warningCount: 0,
       diagnostic: { kind: 'syntax' },
     });
+  });
+
+  it('does not expose main-only SSH authentication metadata or warning paths over LIST IPC', async () => {
+    const visible = host('visible', {
+      identityFile: '/Users/example/.ssh/private.key',
+      sshAuthentication: {
+        identitiesOnly: true,
+        identityAgent: '/private/tmp/agent.sock',
+        configuredIdentityFiles: ['/Users/example/.ssh/private.key'],
+        identityFileDirectiveSeen: true,
+        identityFileNoneSeen: false,
+        allowedAgentFingerprints: ['SHA256:secret-fingerprint'],
+      },
+    });
+    mocks.readSshConfigDetailed.mockResolvedValueOnce({
+      hosts: [visible],
+      diagnostic: null,
+      warnings: ['/Users/example/.ssh/config:12: unsupported conditional Include'],
+    });
+
+    const result = await handler(REMOTE_SSH_INVOKE.RELOAD_CONFIG)({});
+    expect(result.warningCount).toBe(1);
+    expect(result).not.toHaveProperty('warnings');
+    expect(result.hosts[0].config).not.toHaveProperty('sshAuthentication');
+    expect(result.hosts[0].config).not.toHaveProperty('identityFile');
+    expect(result.hosts[0].config).toMatchObject({
+      identityFileConfigured: true,
+      identityFileName: 'private.key',
+    });
+    expect(JSON.stringify(result)).not.toContain('secret-fingerprint');
+    expect(JSON.stringify(result)).not.toContain('/Users/example/.ssh/private.key');
+    expect(JSON.stringify(result)).not.toContain('/Users/example/.ssh/config');
+  });
+
+  it('preserves an existing main-only identity path when Renderer edits other fields', async () => {
+    const current = host('preserve-key', {
+      authMethod: 'key',
+      identityFile: '/Users/example/.ssh/preserve.key',
+    });
+    await getRemoteSshPool().hydrate([current]);
+    const onDisk = { ...getRemoteSshPool().get(current.id)!.config };
+    const updated = { ...onDisk, hostname: '192.0.2.210' };
+    mocks.readSshConfigDetailed
+      .mockResolvedValueOnce(successfulRead([onDisk]))
+      .mockResolvedValueOnce(successfulRead([onDisk]))
+      .mockResolvedValueOnce(successfulRead([updated]));
+
+    const result = await handler(REMOTE_SSH_INVOKE.UPDATE)({}, {
+      id: current.id,
+      displayName: current.id,
+      hostname: updated.hostname,
+      port: current.port,
+      user: current.user,
+      authMethod: current.authMethod,
+      identityFileUnchanged: true,
+    });
+
+    expect(mocks.updateManagedHostFields).toHaveBeenCalledWith(expect.objectContaining({
+      identityFile: current.identityFile,
+    }), expect.any(String));
+    expect(result.host.config).toMatchObject({
+      identityFileConfigured: true,
+      identityFileName: 'preserve.key',
+    });
+    expect(JSON.stringify(result)).not.toContain('/Users/example/.ssh/preserve.key');
   });
 
   it('keeps a live endpoint connected when UPDATE cannot write', async () => {
@@ -223,6 +288,42 @@ describe('remote SSH mutation runtime semantics', () => {
     expect(mocks.patchPref).toHaveBeenCalledWith('new-host', {
       displayName: 'new-host',
     });
+  });
+
+  it('reports a stable partial-success code when ADD commits but local prefs cannot be written', async () => {
+    const added = host('prefs-failed');
+    mocks.readSshConfigDetailed
+      .mockResolvedValueOnce(successfulRead([]))
+      .mockResolvedValueOnce(successfulRead([added]));
+    mocks.patchPref.mockImplementationOnce(() => {
+      throw new Error('userData is read-only');
+    });
+
+    await expect(handler(REMOTE_SSH_INVOKE.ADD)({}, {
+      id: added.id,
+      hostname: added.hostname,
+      user: added.user,
+      displayName: 'Friendly name',
+    })).rejects.toMatchObject({ code: 'SSH_HOST_PREFS_WRITE_FAILED' });
+
+    expect(mocks.addManagedHostWithInclude).toHaveBeenCalledOnce();
+    expect(getRemoteSshPool().get(added.id)?.config.id).toBe(added.id);
+  });
+
+  it('reports a stable local-prefs error instead of a raw filesystem failure on UPDATE', async () => {
+    const external = host('prefs-only', { managedByCindy: false });
+    await getRemoteSshPool().hydrate([external]);
+    mocks.patchPref.mockImplementationOnce(() => {
+      throw new Error('rename failed');
+    });
+
+    await expect(handler(REMOTE_SSH_INVOKE.UPDATE)({}, {
+      ...external,
+      displayName: 'Unsaved name',
+    })).rejects.toMatchObject({ code: 'SSH_HOST_PREFS_WRITE_FAILED' });
+
+    expect(mocks.updateManagedHostFields).not.toHaveBeenCalled();
+    expect(getRemoteSshPool().get(external.id)).toBeTruthy();
   });
 
   it('disconnects only the target when UPDATE writes but refresh fails', async () => {

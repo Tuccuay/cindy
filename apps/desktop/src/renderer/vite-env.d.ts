@@ -99,10 +99,26 @@ interface EnvCheckResult {
 // Voice-input wire types: re-export from voice-input-core to keep the IPC
 // surface and the core package's contract in sync. `VoiceInputShortcut` is
 // renderer-only (defined in voice-input/shortcut.ts) so it stays inline.
-// HostSnapshot 来自 transport-only package; desktop main 端 wrap 时附加
-// autoConnect / agentProxy 偏好字段 (本地 prefs, 不写入 ~/.ssh/config), 渲染层统一用
-// 这个扩展类型即可一次拿到完整信息, 不必再为单个字段单独 IPC。
-type RemoteHostSnapshot = import('@cindy/maker-remote-ssh').HostSnapshot & {
+// Renderer 只声明 Main 明确投影的 SSH 视图字段。transport package 内的
+// IdentityAgent、IdentityFile 累积列表和指纹属于 main-only 认证元数据，不能因
+// HostSnapshot 结构扩展而自动穿过 preload。Desktop 偏好字段在同一 payload 附加。
+type RemoteHostSnapshot = {
+  config: {
+    id: string;
+    displayName?: string;
+    hostname: string;
+    port: number;
+    user: string;
+    authMethod: 'agent' | 'key';
+    identityFileConfigured: boolean;
+    identityFileName?: string;
+    source: 'ssh-config' | 'manual';
+    managedByCindy: boolean;
+  };
+  status: import('@cindy/maker-remote-ssh').RemoteStatus;
+  lastError?: string;
+  lastAuthLabel?: string;
+  statusChangedAt: number;
   autoConnect: boolean;
   /** Agent 流量经 SSH 隧道走本地 Proxy 的 per-host 配置; 未开启 → null。 */
   agentProxy: AgentProxyPrefPayload | null;
@@ -3724,12 +3740,12 @@ interface ElectronAPI {
   remoteSsh: {
     list: () => Promise<{
       hosts: RemoteHostSnapshot[];
-      warnings?: string[];
+      warningCount?: number;
       diagnostic?: { kind: 'io' | 'syntax' | 'limit' } | null;
     }>;
     reloadConfig: () => Promise<{
       hosts: RemoteHostSnapshot[];
-      warnings?: string[];
+      warningCount?: number;
       diagnostic?: { kind: 'io' | 'syntax' | 'limit' } | null;
     }>;
     add: (host: {
@@ -3751,6 +3767,8 @@ interface ElectronAPI {
       user: string;
       authMethod?: 'agent' | 'key';
       identityFile?: string;
+      /** Preserve the existing main-only path without returning it to Renderer. */
+      identityFileUnchanged?: boolean;
       agentProxy?: AgentProxyPrefPayload | null;
     }) => Promise<{ host: RemoteHostSnapshot }>;
     remove: (id: string) => Promise<{ ok: true }>;

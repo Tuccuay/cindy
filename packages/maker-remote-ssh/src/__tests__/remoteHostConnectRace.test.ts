@@ -16,8 +16,11 @@ class FakeClient extends EventEmitter {
   forwardInPending: Array<(err: Error | undefined, port: number) => void> = [];
   unforwardInCalls: Array<{ addr: string; port: number }> = [];
   ended = false;
+  connectConfig: { hostVerifier?: (key: Buffer, verify: (valid: boolean) => void) => void } | null = null;
 
-  connect(): void {}
+  connect(config?: { hostVerifier?: (key: Buffer, verify: (valid: boolean) => void) => void }): void {
+    this.connectConfig = config ?? null;
+  }
   forwardIn(_addr: string, _port: number, cb: (err: Error | undefined, port: number) => void): void {
     this.forwardInPending.push(cb);
   }
@@ -54,6 +57,7 @@ vi.mock('../credentials.js', () => ({
 }));
 
 import { RemoteHost } from '../RemoteHost.js';
+import type { HostKeyStore } from '../hostKeys.js';
 import type { HostConfig } from '../types.js';
 
 const HOST_CONFIG: HostConfig = {
@@ -135,6 +139,54 @@ describe('RemoteHost arm/disconnect race', () => {
     await expect(connectP).rejects.toThrow('SSH connection attempt cancelled');
     expect(h.client).toBeNull();
     expect(host.getStatus()).toBe('disconnected');
+  });
+
+  it('disconnect wakes concurrent connect joiners while credential resolution is still in flight', async () => {
+    h.client = null;
+    let finishAuth!: (value: { label: string }) => void;
+    h.resolveAuth.mockImplementationOnce(() => new Promise((resolve) => {
+      finishAuth = resolve;
+    }));
+    const host = new RemoteHost(HOST_CONFIG, { logger: noopLogger });
+
+    const first = host.connect();
+    const joiner = host.connect();
+    await Promise.resolve();
+    await host.disconnect();
+    finishAuth({ label: 'agent' });
+
+    await expect(first).rejects.toThrow('SSH connection attempt cancelled');
+    await expect(joiner).rejects.toThrow();
+    expect(host.getStatus()).toBe('disconnected');
+  });
+
+  it('a stale host verifier cannot persist trust or write errors for a replacement endpoint', async () => {
+    let finishGet!: (fingerprint: string | null) => void;
+    const store: HostKeyStore = {
+      reload: vi.fn(),
+      get: vi.fn(() => new Promise<string | null>((resolve) => { finishGet = resolve; })),
+      set: vi.fn(async () => undefined),
+    };
+    const host = new RemoteHost(HOST_CONFIG, { logger: noopLogger, hostKeys: store });
+    const connectP = host.connect();
+    const connectAssertion = expect(connectP).rejects.toThrow('SSH connection attempt cancelled');
+    await flush();
+    const client = h.client!;
+    const verifier = client.connectConfig?.hostVerifier;
+    expect(verifier).toBeTypeOf('function');
+    const verdict = new Promise<boolean>((resolve) => {
+      verifier!(Buffer.from('old-server-key'), resolve);
+    });
+    await Promise.resolve();
+
+    await host.disconnect();
+    host.updateConfig({ ...HOST_CONFIG, hostname: '10.0.0.99', port: 2222 });
+    finishGet(null);
+
+    await expect(verdict).resolves.toBe(false);
+    await connectAssertion;
+    expect(store.set).not.toHaveBeenCalled();
+    expect(host.snapshot().lastError).toBeUndefined();
   });
 
   it('disconnect before SSH ready invalidates late client events', async () => {

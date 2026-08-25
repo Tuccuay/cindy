@@ -11,8 +11,13 @@ import { randomBytes } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import SSHConfig, { glob as matchesHostPattern } from 'ssh-config';
+import SSHConfig from 'ssh-config';
 
+import {
+  defaultIdentityPaths,
+  resolveIdentityFingerprints,
+  type IdentityFingerprintResolution,
+} from './sshAuthentication.js';
 import type { HostConfig } from './types.js';
 
 const DEFAULT_PORT = 22;
@@ -162,7 +167,7 @@ export async function readSshConfigDetailed(
   }
 
   return {
-    hosts: buildHosts(state, managedComparable),
+    hosts: await buildHosts(state, managedComparable),
     diagnostic: null,
     warnings: state.warnings,
   };
@@ -293,7 +298,15 @@ async function walkFile(
     if (scope.kind === 'match') continue;
 
     const name = directive.keyword;
-    if (name === 'hostname' || name === 'user' || name === 'port' || name === 'identityfile') {
+    if (name === 'hostname'
+      || name === 'user'
+      || name === 'port'
+      || name === 'identityfile'
+      || name === 'identitiesonly'
+      || name === 'identityagent'
+      || name === 'certificatefile'
+      || name === 'pkcs11provider'
+      || name === 'securitykeyprovider') {
       state.directives.push({
         name,
         value: firstWordOrRaw(directive.value),
@@ -304,8 +317,12 @@ async function walkFile(
   }
 }
 
-function buildHosts(state: WalkState, managedComparable: string | null): HostConfig[] {
+async function buildHosts(
+  state: WalkState,
+  managedComparable: string | null,
+): Promise<HostConfig[]> {
   const aliases: string[] = [];
+  const fingerprintCache = new Map<string, Promise<IdentityFingerprintResolution>>();
   const seen = new Set<string>();
   for (const declaration of state.declarations) {
     for (const pattern of declaration.patterns) {
@@ -315,37 +332,33 @@ function buildHosts(state: WalkState, managedComparable: string | null): HostCon
     }
   }
 
-  return aliases.map((alias) => {
+  const hosts: HostConfig[] = [];
+  // Keep public-key inspection sequential. A config may contain many aliases
+  // pointing at the same identities; unbounded Promise.all would turn a small
+  // config into a burst of file descriptors during startup.
+  for (const alias of aliases) {
     const introducing = state.declarations.filter((declaration) =>
       declaration.patterns.some((pattern) => pattern === alias));
     const firstIntroducing = introducing[0];
-    const concreteIdentity = firstMatchingDirective(
-      state.directives,
-      alias,
-      'identityfile',
-      (scope) => scope.kind === 'host'
-        && scope.declaration.patterns.some((pattern) => pattern === alias),
-    );
-    const fallbackIdentity = firstMatchingDirective(
-      state.directives,
-      alias,
-      'identityfile',
-      (scope) => scope.kind === 'root'
-        || (scope.kind === 'host'
-          && !scope.declaration.patterns.some((pattern) => pattern === alias)),
-    );
-    // Cindy/ssh2 consumes one key rather than OpenSSH's accumulated key list.
-    // Prefer a key declared by the concrete Host alias; only then inherit the
-    // first matching root/wildcard key. The auth marker still belongs solely
-    // to the first concrete declaration that introduced the alias.
+    const identityDirectives = matchingDirectives(state.directives, alias, 'identityfile');
+    const introducingIdentity = identityDirectives.find((directive) =>
+      directive.scope.kind === 'host'
+      && directive.scope.declaration === firstIntroducing
+      && directive.value.toLowerCase() !== 'none')?.value;
     const marker = firstIntroducing?.marker ?? null;
-    // An explicit, unpinned agent marker must stay unfiltered. Inheriting a
-    // wildcard IdentityFile here would make credentials.ts wrap ssh-agent in a
-    // FilteredAgent for a key the user never selected.
-    const identityRaw = marker === 'agent' && concreteIdentity === undefined
-      ? undefined
-      : concreteIdentity ?? fallbackIdentity;
-    const authMethod = identityRaw ? marker ?? 'key' : 'agent';
+    // Strategy B: ordinary OpenSSH hosts are Agent-first, independently of
+    // whether the concrete IdentityFile lives in the main file or an Include.
+    // Only Cindy's marker opts into direct private-key reads or an explicit
+    // agent pin. Compatibility trade-off: a legacy no-marker host that relied
+    // on Cindy reading an unencrypted private key must load it with ssh-add or
+    // migrate to a marked Cindy-managed key host. managedByCindy remains
+    // ownership-only.
+    const authMethod = marker ?? 'agent';
+    const identityRaw = marker === 'key'
+      ? introducingIdentity
+      : marker === 'agent'
+        ? introducingIdentity
+        : undefined;
     const hostname = firstMatchingDirective(state.directives, alias, 'hostname') ?? alias;
     const user = firstMatchingDirective(state.directives, alias, 'user')
       ?? os.userInfo().username;
@@ -356,19 +369,120 @@ function buildHosts(state: WalkState, managedComparable: string | null): HostCon
       && firstIntroducing?.patterns.length === 1
       && pathsEqual(firstIntroducing.physicalPath, managedComparable);
 
-    return {
+    const identityFileDirectiveSeen = identityDirectives.length > 0;
+    const identityFileNoneSeen = identityDirectives.some(
+      (directive) => directive.value.toLowerCase() === 'none',
+    );
+    const explicitIdentityFiles = identityDirectives
+      .filter((directive) => directive.value.toLowerCase() !== 'none')
+      .map((directive) => expandIdentityFile(directive.value));
+    const identitiesOnlyRaw = firstMatchingDirective(
+      state.directives,
+      alias,
+      'identitiesonly',
+    );
+    const identitiesOnly = identitiesOnlyRaw?.toLowerCase() === 'yes';
+    const configuredIdentityFiles = identityFileDirectiveSeen
+      ? explicitIdentityFiles
+      : identitiesOnly
+        ? defaultIdentityPaths()
+        : [];
+    let unsupportedReason = identitiesOnlyRaw !== undefined
+      && identitiesOnlyRaw.toLowerCase() !== 'yes'
+      && identitiesOnlyRaw.toLowerCase() !== 'no'
+      ? `unsupported IdentitiesOnly value: ${identitiesOnlyRaw}`
+      : undefined;
+    const unsupportedAgentDirectives = [
+      'certificatefile',
+      'pkcs11provider',
+      'securitykeyprovider',
+    ].filter((name) => matchingDirectives(state.directives, alias, name).length > 0);
+    if (authMethod === 'agent' && unsupportedAgentDirectives.length > 0) {
+      if (identitiesOnly) {
+        unsupportedReason ??= `Cindy cannot enforce IdentitiesOnly with ${unsupportedAgentDirectives.join(', ')}`;
+      } else {
+        state.warnings.push(
+          `Host ${alias}: ${unsupportedAgentDirectives.join(', ')} is not interpreted by Cindy; SSH Agent will be used.`,
+        );
+      }
+    }
+    let allowedAgentFingerprints: string[] | undefined;
+    if (authMethod === 'agent' && identitiesOnly && !unsupportedReason) {
+      const resolved = await resolveCompleteFingerprintSet(
+        configuredIdentityFiles,
+        !identityFileDirectiveSeen,
+        fingerprintCache,
+      );
+      allowedAgentFingerprints = resolved.fingerprints;
+      unsupportedReason = resolved.unsupportedReason;
+    }
+
+    hosts.push({
       id: alias,
       hostname,
       port,
       user,
       authMethod,
       identityFile: identityRaw
-        ? expandIdentityFile(identityRaw, state.rootDir)
+        ? expandIdentityFile(identityRaw)
         : undefined,
+      sshAuthentication: {
+        ...(marker ? { marker } : {}),
+        identitiesOnly,
+        ...(firstMatchingDirective(state.directives, alias, 'identityagent') !== undefined
+          ? { identityAgent: firstMatchingDirective(state.directives, alias, 'identityagent') }
+          : {}),
+        configuredIdentityFiles,
+        identityFileDirectiveSeen,
+        identityFileNoneSeen,
+        ...(allowedAgentFingerprints ? { allowedAgentFingerprints } : {}),
+        ...(unsupportedReason ? { unsupportedReason } : {}),
+      },
       source: 'ssh-config' as const,
       managedByCindy: uniquelyManaged,
-    };
-  });
+    });
+  }
+  return hosts;
+}
+
+async function resolveCompleteFingerprintSet(
+  identityFiles: string[],
+  usingDefaults: boolean,
+  cache: Map<string, Promise<IdentityFingerprintResolution>>,
+): Promise<{ fingerprints?: string[]; unsupportedReason?: string }> {
+  const fingerprints: string[] = [];
+  for (const identityFile of identityFiles) {
+    let pending = cache.get(identityFile);
+    if (!pending) {
+      pending = resolveIdentityFingerprints(identityFile);
+      cache.set(identityFile, pending);
+    }
+    const resolved = await pending;
+    if (usingDefaults && resolved.missing) continue;
+    if (resolved.fingerprints.length === 0) {
+      return {
+        unsupportedReason: usingDefaults
+          ? `default identity ${identityFile} exists but Cindy cannot resolve its public key`
+          : `IdentityFile ${identityFile} has no public key Cindy can resolve without reading the private key`,
+      };
+    }
+    for (const fingerprint of resolved.fingerprints) {
+      if (!fingerprints.includes(fingerprint)) fingerprints.push(fingerprint);
+    }
+  }
+  return fingerprints.length > 0
+    ? { fingerprints }
+    : { unsupportedReason: 'IdentitiesOnly yes has no identity Cindy can pin in ssh-agent' };
+}
+
+function matchingDirectives(
+  directives: DirectiveRecord[],
+  alias: string,
+  name: string,
+): DirectiveRecord[] {
+  return directives
+    .filter((directive) => directive.name === name && scopeMatches(directive.scope, alias))
+    .sort((a, b) => a.order - b.order);
 }
 
 function firstMatchingDirective(
@@ -392,6 +506,32 @@ function scopeMatches(scope: Scope, alias: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * OpenSSH host patterns support only `*`, `?`, and a leading `!` negation.
+ * The ssh-config package's glob helper treats `?` as optional (`.?`), which
+ * can apply a wildcard block to the wrong alias (for example `foo?` → `foo`).
+ */
+function matchesHostPattern(patterns: readonly string[], alias: string): boolean {
+  let matched = false;
+  for (const rawPattern of patterns) {
+    const negated = rawPattern.startsWith('!');
+    const pattern = negated ? rawPattern.slice(1) : rawPattern;
+    let source = '^';
+    for (const char of pattern) {
+      if (char === '*') source += '.*';
+      else if (char === '?') source += '.';
+      else source += char.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
+    }
+    source += '$';
+    // OpenSSH host patterns are case-sensitive. Do not pass the `i` flag:
+    // `Host F*` must not match the distinct alias `foo`.
+    if (!new RegExp(source).test(alias)) continue;
+    if (negated) return false;
+    matched = true;
+  }
+  return matched;
 }
 
 function isSupportedIncludeScope(scope: Scope): boolean {
@@ -476,9 +616,11 @@ function isConcreteAlias(alias: string): boolean {
     && !alias.startsWith('!');
 }
 
-function expandIdentityFile(value: string, configDir: string): string {
+function expandIdentityFile(value: string): string {
   const expanded = expandHome(value);
-  return path.isAbsolute(expanded) ? expanded : path.resolve(configDir, expanded);
+  // Unlike Include, OpenSSH does not resolve a relative IdentityFile against
+  // the config file directory. It remains relative to the ssh process cwd.
+  return path.isAbsolute(expanded) ? expanded : path.resolve(process.cwd(), expanded);
 }
 
 async function globPaths(pattern: string): Promise<string[]> {

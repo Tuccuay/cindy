@@ -352,6 +352,25 @@ describe('ssh_exec', () => {
     expect(payload.errorCode).toBe('SSH_CONNECT_FAILED');
   });
 
+  it.each([
+    ['SSH_CONFIG_AUTH_UNSUPPORTED', 'IdentityAgent none'],
+    ['SSH_AGENT_UNAVAILABLE', '$SSH_AUTH_SOCK is not set'],
+  ])('ensureReady %s remains a deterministic actionable error', async (code, detail) => {
+    const { pool } = makeFakePool([snapshot({ id: 'web-1' })]);
+    const { deps } = makeDeps(pool, {
+      ensureReady: async () => {
+        throw new Error(`[${code}] ${detail}`);
+      },
+    });
+    const { payload, isError } = await callParsed(makeRegistry(deps), 'ssh_exec', {
+      host: 'web-1',
+      command: 'true',
+    });
+    expect(isError).toBe(true);
+    expect(payload.errorCode).toBe(code);
+    expect(String((payload.data as Record<string, unknown>).hint)).toContain('重复');
+  });
+
   it('unprefixed unknown error falls back to SSH_CONNECT_FAILED', async () => {
     const { pool } = makeFakePool([snapshot({ id: 'web-1' })], async () => {
       throw new Error('socket hangup');

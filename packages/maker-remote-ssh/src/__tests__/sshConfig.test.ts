@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   addManagedHost,
@@ -18,6 +18,8 @@ import type { HostConfig } from '../types.js';
 let scratchDir: string;
 let mainConfig: string;
 let managedConfig: string;
+const TEST_PUBLIC_KEY = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPFqmiBYVCrZsGBJy/djBu4yIr1lYkTuOXI0A9vPN/lD cindy-test\n';
+const TEST_PUBLIC_KEY_2 = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIkv84ni34F924G7htx9qVI7CcGG5xYDJQoabgKUbMiv cindy-test-2\n';
 
 beforeEach(async () => {
   scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cindy-ssh-config-'));
@@ -69,6 +71,55 @@ describe('OpenSSH config discovery', () => {
     ]);
   });
 
+  it('requires OpenSSH ? patterns to match exactly one character', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host foo',
+      '  HostName right.example',
+      'Host foo?',
+      '  User should-not-apply',
+      '  Port 2200',
+      'Host fooa',
+      '  HostName one-character.example',
+      '',
+    ].join('\n'));
+
+    const hosts = await readSshConfig(mainConfig);
+    expect(hosts.find((item) => item.id === 'foo')).toMatchObject({
+      hostname: 'right.example',
+      port: 22,
+    });
+    expect(hosts.find((item) => item.id === 'foo')?.user).not.toBe('should-not-apply');
+    expect(hosts.find((item) => item.id === 'fooa')).toMatchObject({
+      hostname: 'one-character.example',
+      user: 'should-not-apply',
+      port: 2200,
+    });
+  });
+
+  it('matches OpenSSH Host patterns case-sensitively', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host F*',
+      '  User uppercase-pattern',
+      'Host * !Foo',
+      '  User not-excluded',
+      'Host Foo',
+      '  HostName 192.0.2.44',
+      'Host foo',
+      '  HostName 192.0.2.45',
+      '',
+    ].join('\n'));
+
+    await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
+      id: 'Foo',
+      hostname: '192.0.2.44',
+      user: 'uppercase-pattern',
+    }, {
+      id: 'foo',
+      hostname: '192.0.2.45',
+      user: 'not-excluded',
+    }]);
+  });
+
   it('keeps token-internal hashes in aliases and IdentityFile values', async () => {
     await fs.writeFile(mainConfig, [
       'Host foo#bar # alias comment',
@@ -80,7 +131,8 @@ describe('OpenSSH config discovery', () => {
     await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
       id: 'foo#bar',
       hostname: '192.0.2.2',
-      identityFile: path.join(scratchDir, 'keys', 'id#deploy'),
+      authMethod: 'agent',
+      identityFile: undefined,
     }]);
   });
 
@@ -98,7 +150,8 @@ describe('OpenSSH config discovery', () => {
     await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
       id: 'nested',
       hostname: '192.0.2.3',
-      identityFile: path.join(scratchDir, 'keys', 'nested.key'),
+      authMethod: 'agent',
+      identityFile: undefined,
     }]);
   });
 
@@ -219,7 +272,7 @@ describe('OpenSSH config discovery', () => {
     });
   });
 
-  it('prefers a concrete IdentityFile over an earlier Host * IdentityFile', async () => {
+  it('keeps ordinary IdentityFile entries as agent metadata regardless of scope', async () => {
     await fs.writeFile(mainConfig, [
       'Host *',
       '  IdentityFile ~/.ssh/id_ed25519',
@@ -231,12 +284,18 @@ describe('OpenSSH config discovery', () => {
 
     await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
       id: 'lab',
-      authMethod: 'key',
-      identityFile: path.join(os.homedir(), '.ssh', 'lab.key'),
+      authMethod: 'agent',
+      identityFile: undefined,
+      sshAuthentication: {
+        configuredIdentityFiles: [
+          path.join(os.homedir(), '.ssh', 'id_ed25519'),
+          path.join(os.homedir(), '.ssh', 'lab.key'),
+        ],
+      },
     }]);
   });
 
-  it('inherits Host * IdentityFile and treats it as key when the introducing block has no marker', async () => {
+  it('keeps agent auth when IdentityFile is inherited only from Host *', async () => {
     await fs.writeFile(mainConfig, [
       'Host foo',
       '  HostName 192.0.2.10',
@@ -247,9 +306,64 @@ describe('OpenSSH config discovery', () => {
 
     await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
       id: 'foo',
-      authMethod: 'key',
-      identityFile: path.join(os.homedir(), '.ssh', 'id_ed25519'),
+      authMethod: 'agent',
+      identityFile: undefined,
     }]);
+  });
+
+  it('uses the same Agent-first policy for concrete IdentityFile in an Include', async () => {
+    await fs.mkdir(path.join(scratchDir, 'config.d'));
+    await fs.writeFile(mainConfig, [
+      'Host *',
+      '  IdentityFile ~/.ssh/id_ed25519',
+      'Include config.d/*',
+      '',
+    ].join('\n'));
+    await fs.writeFile(path.join(scratchDir, 'config.d', 'lab.conf'), [
+      'Host lab',
+      '  HostName 192.0.2.11',
+      '  IdentityFile ~/.ssh/lab.key',
+      '',
+    ].join('\n'));
+
+    await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
+      id: 'lab',
+      authMethod: 'agent',
+      identityFile: undefined,
+    }]);
+  });
+
+  it('does not let a later duplicate Host block change agent auth classification', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host duplicate',
+      '  HostName 192.0.2.12',
+      'Host duplicate',
+      '  IdentityFile ~/.ssh/later.key',
+      '',
+    ].join('\n'));
+
+    await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
+      id: 'duplicate',
+      authMethod: 'agent',
+      identityFile: undefined,
+    }]);
+  });
+
+  it('honors a marker in a read-only main-config host', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host marked',
+      '  # xdt-maker:auth=agent',
+      '  IdentityFile ~/.ssh/marked.key',
+      '',
+    ].join('\n'));
+
+    await expect(readSshConfig(mainConfig, { managedConfigPath: managedConfig }))
+      .resolves.toMatchObject([{
+        id: 'marked',
+        authMethod: 'agent',
+        identityFile: path.join(os.homedir(), '.ssh', 'marked.key'),
+        managedByCindy: false,
+      }]);
   });
 
   it('takes the auth marker only from the first concrete declaration introducing an alias', async () => {
@@ -265,8 +379,241 @@ describe('OpenSSH config discovery', () => {
     await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
       id: 'duplicate',
       authMethod: 'key',
-      identityFile: path.join(scratchDir, 'first.key'),
+      identityFile: path.resolve(process.cwd(), 'first.key'),
     }]);
+  });
+
+  it('resolves relative IdentityFile values from the SSH process cwd, not the config directory', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host relative-key',
+      '  # xdt-maker:auth=key',
+      '  IdentityFile keys/id_ed25519',
+      '',
+    ].join('\n'));
+
+    await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
+      id: 'relative-key',
+      identityFile: path.resolve(process.cwd(), 'keys/id_ed25519'),
+    }]);
+  });
+
+  it('keeps a no-marker IdentityFile host on unfiltered Agent without guessing .pub', async () => {
+    const labKey = path.join(scratchDir, 'lab.key');
+    await fs.writeFile(labKey, 'invalid-identity-fixture');
+    await fs.writeFile(path.join(scratchDir, 'lab.pub'), TEST_PUBLIC_KEY);
+    await fs.writeFile(mainConfig, [
+      'Host lab',
+      `  IdentityFile ${labKey}`,
+      '',
+    ].join('\n'));
+
+    await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
+      id: 'lab',
+      authMethod: 'agent',
+      identityFile: undefined,
+      sshAuthentication: {
+        identitiesOnly: false,
+        configuredIdentityFiles: [labKey],
+      },
+    }]);
+  });
+
+  it('does not infer a custom lab.pub sibling for lab.key when IdentitiesOnly is yes', async () => {
+    const labKey = path.join(scratchDir, 'lab.key');
+    await fs.writeFile(labKey, 'invalid-identity-fixture');
+    await fs.writeFile(path.join(scratchDir, 'lab.pub'), TEST_PUBLIC_KEY);
+    await fs.writeFile(mainConfig, [
+      'Host lab-strict',
+      '  IdentitiesOnly yes',
+      `  IdentityFile ${labKey}`,
+      '',
+    ].join('\n'));
+
+    const [hostConfig] = await readSshConfig(mainConfig);
+    expect(hostConfig).toMatchObject({
+      id: 'lab-strict',
+      authMethod: 'agent',
+      identityFile: undefined,
+      sshAuthentication: {
+        configuredIdentityFiles: [labKey],
+        identitiesOnly: true,
+      },
+    });
+    expect(hostConfig?.sshAuthentication?.allowedAgentFingerprints).toBeUndefined();
+    expect(hostConfig?.sshAuthentication?.unsupportedReason).toContain(labKey);
+  });
+
+  it('pins every explicit identity in order for IdentitiesOnly yes', async () => {
+    const first = path.join(scratchDir, 'first.key');
+    const second = path.join(scratchDir, 'second.pub');
+    await fs.writeFile(`${first}.pub`, TEST_PUBLIC_KEY);
+    await fs.writeFile(second, TEST_PUBLIC_KEY_2);
+    await fs.writeFile(mainConfig, [
+      'Host pinned',
+      '  IdentitiesOnly yes',
+      `  IdentityFile ${first}`,
+      '  IdentityFile none',
+      `  IdentityFile ${second}`,
+      '',
+    ].join('\n'));
+
+    const [pinned] = await readSshConfig(mainConfig);
+    expect(pinned).toMatchObject({
+      id: 'pinned',
+      authMethod: 'agent',
+      identityFile: undefined,
+      sshAuthentication: {
+        identitiesOnly: true,
+        configuredIdentityFiles: [first, second],
+        identityFileDirectiveSeen: true,
+        identityFileNoneSeen: true,
+      },
+    });
+    expect(pinned?.sshAuthentication?.allowedAgentFingerprints).toHaveLength(2);
+    expect(pinned?.sshAuthentication?.unsupportedReason).toBeUndefined();
+  });
+
+  it('fails closed when any explicit IdentitiesOnly identity has no public key', async () => {
+    const valid = path.join(scratchDir, 'valid.key');
+    const missing = path.join(scratchDir, 'missing.key');
+    await fs.writeFile(`${valid}.pub`, TEST_PUBLIC_KEY);
+    await fs.writeFile(mainConfig, [
+      'Host incomplete',
+      '  IdentitiesOnly yes',
+      `  IdentityFile ${valid}`,
+      `  IdentityFile ${missing}`,
+      '',
+    ].join('\n'));
+
+    const [hostConfig] = await readSshConfig(mainConfig);
+    expect(hostConfig?.sshAuthentication?.allowedAgentFingerprints).toBeUndefined();
+    expect(hostConfig?.sshAuthentication?.unsupportedReason).toContain(missing);
+  });
+
+  it('treats IdentityFile none as a sentinel without clearing explicit entries', async () => {
+    const first = path.join(scratchDir, 'a.key');
+    const second = path.join(scratchDir, 'b.key');
+    await fs.writeFile(mainConfig, [
+      'Host sentinel',
+      `  IdentityFile ${first}`,
+      '  IdentityFile NONE',
+      `  IdentityFile ${second}`,
+      '',
+    ].join('\n'));
+
+    await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
+      id: 'sentinel',
+      authMethod: 'agent',
+      sshAuthentication: {
+        identitiesOnly: false,
+        configuredIdentityFiles: [first, second],
+        identityFileNoneSeen: true,
+      },
+    }]);
+  });
+
+  it('rejects IdentitiesOnly yes with only IdentityFile none', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host empty-pin',
+      '  IdentitiesOnly yes',
+      '  IdentityFile none',
+      '',
+    ].join('\n'));
+
+    const [hostConfig] = await readSshConfig(mainConfig);
+    expect(hostConfig?.sshAuthentication?.configuredIdentityFiles).toEqual([]);
+    expect(hostConfig?.sshAuthentication?.unsupportedReason).toContain('no identity');
+  });
+
+  it('uses first-value-wins for IdentitiesOnly across Host * and exact blocks', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host *',
+      '  IdentitiesOnly yes',
+      '  IdentityFile none',
+      'Host inherited-yes',
+      '  IdentitiesOnly no',
+      '',
+    ].join('\n'));
+
+    await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
+      id: 'inherited-yes',
+      sshAuthentication: {
+        identitiesOnly: true,
+        unsupportedReason: expect.any(String),
+      },
+    }]);
+  });
+
+  it('keeps an earlier exact IdentitiesOnly no ahead of a later Host * yes', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host exact-no',
+      '  IdentitiesOnly no',
+      'Host *',
+      '  IdentitiesOnly yes',
+      '  IdentityFile none',
+      '',
+    ].join('\n'));
+
+    await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
+      id: 'exact-no',
+      sshAuthentication: {
+        identitiesOnly: false,
+      },
+    }]);
+  });
+
+  it('fails closed when a present default identity has no resolvable public key', async () => {
+    const homeSpy = vi.spyOn(os, 'homedir').mockReturnValue(scratchDir);
+    try {
+      const sshDir = path.join(scratchDir, '.ssh');
+      await fs.mkdir(sshDir);
+      await fs.writeFile(
+        path.join(sshDir, 'id_ed25519'),
+        'invalid-identity-fixture',
+      );
+      await fs.writeFile(mainConfig, 'Host defaults\n  IdentitiesOnly yes\n');
+
+      const [hostConfig] = await readSshConfig(mainConfig);
+      expect(hostConfig?.sshAuthentication?.unsupportedReason).toContain('id_ed25519');
+      expect(hostConfig?.sshAuthentication?.allowedAgentFingerprints).toBeUndefined();
+    } finally {
+      homeSpy.mockRestore();
+    }
+  });
+
+  it('pins a present default identity when its .pub sibling is valid', async () => {
+    const homeSpy = vi.spyOn(os, 'homedir').mockReturnValue(scratchDir);
+    try {
+      const sshDir = path.join(scratchDir, '.ssh');
+      await fs.mkdir(sshDir);
+      await fs.writeFile(path.join(sshDir, 'id_ed25519.pub'), TEST_PUBLIC_KEY);
+      await fs.writeFile(mainConfig, 'Host defaults\n  IdentitiesOnly yes\n');
+
+      const [hostConfig] = await readSshConfig(mainConfig);
+      expect(hostConfig?.sshAuthentication?.allowedAgentFingerprints).toHaveLength(1);
+      expect(hostConfig?.sshAuthentication?.unsupportedReason).toBeUndefined();
+    } finally {
+      homeSpy.mockRestore();
+    }
+  });
+
+  it('warns for unsupported agent directives and rejects them with IdentitiesOnly yes', async () => {
+    const key = path.join(scratchDir, 'cert.key');
+    await fs.writeFile(`${key}.pub`, TEST_PUBLIC_KEY);
+    await fs.writeFile(mainConfig, [
+      'Host warning-only',
+      '  PKCS11Provider /tmp/provider.so',
+      'Host strict-cert',
+      '  IdentitiesOnly yes',
+      `  IdentityFile ${key}`,
+      '  CertificateFile cert.pub',
+      '',
+    ].join('\n'));
+
+    const result = await readSshConfigDetailed(mainConfig);
+    expect(result.warnings.join('\n')).toContain('pkcs11provider');
+    expect(result.hosts.find((hostConfig) => hostConfig.id === 'strict-cert')
+      ?.sshAuthentication?.unsupportedReason).toContain('CertificateFile'.toLowerCase());
   });
 
   it('lists each alias in Host foo bar but keeps both read-only', async () => {

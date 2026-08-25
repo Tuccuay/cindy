@@ -44,6 +44,8 @@ export type SshErrorCode =
   | 'AMBIGUOUS_HOST'
   | 'SSH_AUTH_FAILED'
   | 'SSH_KEY_FILE_NOT_FOUND'
+  | 'SSH_AGENT_UNAVAILABLE'
+  | 'SSH_CONFIG_AUTH_UNSUPPORTED'
   | 'SSH_CONNECT_FAILED'
   | 'EXEC_TIMEOUT'
   | 'PLUGIN_DISABLED'
@@ -188,6 +190,16 @@ export function classifySshError(err: unknown): ClassifiedSshError {
         // doesn't mix an English prefix into the localized message — same
         // treatment the renderer toast applies.
         hint: `配置的私钥文件在本机磁盘上不存在/不可读（本机路径问题，不是网络或服务端错误）：${detail.replace(/^identity file not found:\s*/, '')}。请到「设置 → 远程连接」重新选择私钥或编辑主机的 Identity file 路径。`,
+      };
+    case 'SSH_AGENT_UNAVAILABLE':
+      return {
+        errorCode: 'SSH_AGENT_UNAVAILABLE',
+        hint: `SSH Agent 当前不可用（重复连接不会自行恢复）：${detail}。请启动 ssh-agent，并用 ssh-add 加载对应私钥后重试。`,
+      };
+    case 'SSH_CONFIG_AUTH_UNSUPPORTED':
+      return {
+        errorCode: 'SSH_CONFIG_AUTH_UNSUPPORTED',
+        hint: `此主机的 SSH 认证配置超出 Cindy 当前支持的子集（重复连接无效，终端 SSH 仍可能成功）：${detail}。请检查 IdentityAgent、IdentitiesOnly 和公钥文件。`,
       };
     default:
       return {

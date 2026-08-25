@@ -23,6 +23,34 @@ export type AuthMethod = 'agent' | 'key';
 export type HostSource = 'ssh-config' | 'manual';
 
 /**
+ * Effective OpenSSH authentication metadata consumed by Cindy's agent path.
+ *
+ * `identityFile` on HostConfig remains reserved for an explicit Cindy marker:
+ * a private key for `auth=key`, or an explicit agent pin for `auth=agent`.
+ * Ordinary OpenSSH IdentityFile entries live here so an external host can be
+ * Agent-first without accidentally reading an encrypted private key or
+ * guessing a sibling `.pub` filename.
+ */
+export interface SshAuthenticationMetadata {
+  /** Marker from the first concrete Host declaration, if Cindy wrote one. */
+  marker?: AuthMethod;
+  /** Effective first-value-wins IdentitiesOnly value. */
+  identitiesOnly: boolean;
+  /** Effective first-value-wins IdentityAgent token, before endpoint expansion. */
+  identityAgent?: string;
+  /** Effective explicit/default identity paths, excluding the `none` sentinel. */
+  configuredIdentityFiles: string[];
+  /** True when any matching IdentityFile directive appeared, including `none`. */
+  identityFileDirectiveSeen: boolean;
+  /** True when a matching case-insensitive IdentityFile `none` sentinel appeared. */
+  identityFileNoneSeen: boolean;
+  /** Ordered, de-duplicated public-key fingerprints used to filter ssh-agent. */
+  allowedAgentFingerprints?: string[];
+  /** Cindy subset limitation. Kept on the host so LIST succeeds; CONNECT fails. */
+  unsupportedReason?: string;
+}
+
+/**
  * One remote machine known to maker. `id` doubles as the SSH alias
  * (the concrete `Host <id>` declaration discovered from OpenSSH config).
  */
@@ -37,6 +65,8 @@ export interface HostConfig {
   authMethod: AuthMethod;
   /** Absolute key path; direct key for `key`, optional agent pin for `agent`. */
   identityFile?: string;
+  /** Effective OpenSSH agent metadata; never overloaded as a private-key path. */
+  sshAuthentication?: SshAuthenticationMetadata;
   source: HostSource;
   /** True only for a unique single-alias block in Cindy's managed SSH file. */
   managedByCindy: boolean;

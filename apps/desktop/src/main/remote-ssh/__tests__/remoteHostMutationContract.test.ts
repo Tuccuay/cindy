@@ -15,6 +15,22 @@ function handlerBody(channel: string, nextChannel: string): string {
 
 describe('remote SSH managed-host mutation contract', () => {
   it.each([
+    ['LIST', 'RELOAD_CONFIG'],
+    ['RELOAD_CONFIG', 'ADD'],
+  ])('%s validates the app renderer before reading SSH config', (channel, nextChannel) => {
+    const body = handlerBody(channel, nextChannel);
+    const guard = body.indexOf('assertTrustedAppRendererEvent(event);');
+    const read = Math.min(
+      ...[
+        body.indexOf('ensureHydrated()'),
+        body.indexOf('hydrateRemoteHosts()'),
+      ].filter((index) => index >= 0),
+    );
+    expect(guard).toBeGreaterThan(-1);
+    expect(guard).toBeLessThan(read);
+  });
+
+  it.each([
     ['ADD', 'UPDATE'],
     ['UPDATE', 'REMOVE'],
     ['REMOVE', 'CONNECT'],

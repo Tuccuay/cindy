@@ -122,13 +122,23 @@ export type {
 } from './sshConfig.js';
 
 export {
-  defaultAgentEndpoint,
   resolveAuth,
   KEY_FILE_NOT_FOUND_CODE,
   KEY_FILE_UNREADABLE_CODE,
   PINNED_AGENT_FAILED_CODE,
+  SSH_CONFIG_AUTH_UNSUPPORTED_CODE,
 } from './credentials.js';
 export type { ResolvedAuth } from './credentials.js';
+
+export {
+  CINDY_DEFAULT_IDENTITY_NAMES,
+  defaultAgentEndpoint,
+  effectiveAuthenticationFingerprint,
+  previewAgentEndpoint,
+  resolveAgentEndpoint,
+  resolveIdentityFingerprints,
+  SSH_AGENT_UNAVAILABLE_CODE,
+} from './sshAuthentication.js';
 
 export type {
   AddHostInput,
@@ -137,4 +147,5 @@ export type {
   HostSnapshot,
   HostSource,
   RemoteStatus,
+  SshAuthenticationMetadata,
 } from './types.js';

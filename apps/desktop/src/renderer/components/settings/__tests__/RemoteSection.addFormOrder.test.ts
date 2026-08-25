@@ -25,6 +25,7 @@ describe('RemoteSection add form order', () => {
     expect(source).toContain('displayName !== snap.config.id');
     expect(source).toContain('!snap.config.managedByCindy');
     expect(source).toContain('connectionFieldsReadOnly={!snap.config.managedByCindy}');
+    expect(source).toContain("t('settings.remote.edit.authenticationFromSshConfig')");
     expect(source).toContain('{snap.config.managedByCindy && (');
   });
 
@@ -33,7 +34,7 @@ describe('RemoteSection add form order', () => {
   });
 
   it('surfaces non-fatal SSH config discovery warnings', () => {
-    expect(source).toContain('setConfigWarnings(res.warnings ?? [])');
+    expect(source).toContain('setConfigWarningCount(res.warningCount ?? 0)');
     expect(source).toContain("t('settings.remote.configWarning')");
   });
 
@@ -42,6 +43,16 @@ describe('RemoteSection add form order', () => {
     expect(source).toContain('settings.remote.configDiagnostic.${configDiagnostic}');
     expect(source).toContain('const reloadCommittedMutationOnce = useCallback');
     expect(source.match(/await reloadCommittedMutationOnce\(\)/g)).toHaveLength(3);
+    expect(source).toContain("code === 'SSH_HOST_PREFS_WRITE_FAILED'");
+    expect(source).toContain('(prefsWriteFailed && connectionFieldsChanged)');
+    expect(source).toContain("t('ipcError.SSH_HOST_PREFS_WRITE_FAILED')");
     expect(source).not.toContain('while (extractIpcError');
+  });
+
+  it('preserves configured identities without receiving their absolute paths', () => {
+    expect(source).toContain('identityFileUnchanged: snap.config.identityFileConfigured');
+    expect(source).toContain('identityFileName: snap.config.identityFileName ??');
+    expect(source).toContain('identityFileUnchanged: form.identityFileUnchanged');
+    expect(source).not.toContain('snap.config.identityFile ??');
   });
 });

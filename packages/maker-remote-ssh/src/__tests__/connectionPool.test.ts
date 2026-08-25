@@ -45,4 +45,27 @@ describe('ConnectionPool.hydrate', () => {
     expect(disconnect).toHaveBeenCalledTimes(1);
     expect(pool.get('lab')?.config.hostname).toBe('192.0.2.99');
   });
+
+  it('disconnects when effective SSH agent authentication metadata changes', async () => {
+    const pool = new ConnectionPool({ logger });
+    const initial = host('lab');
+    initial.sshAuthentication = {
+      identitiesOnly: false,
+      identityAgent: '/tmp/agent-a.sock',
+      configuredIdentityFiles: [],
+      identityFileDirectiveSeen: false,
+      identityFileNoneSeen: false,
+    };
+    const existing = pool.add(initial);
+    const disconnect = vi.spyOn(existing, 'disconnect').mockResolvedValue();
+    const next = host('lab');
+    next.sshAuthentication = {
+      ...initial.sshAuthentication,
+      identityAgent: '/tmp/agent-b.sock',
+    };
+
+    await pool.hydrate([next]);
+
+    expect(disconnect).toHaveBeenCalledTimes(1);
+  });
 });

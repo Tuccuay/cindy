@@ -38,6 +38,7 @@ import {
   checkRemoteCodexAuth,
   pushRemoteCodexAuth,
   expandHome,
+  effectiveAuthenticationFingerprint,
   FileHostKeyStore,
   RemoteHost,
   type AddHostInput,
@@ -339,7 +340,7 @@ export async function ensureRemoteHostReady(id: string): Promise<void> {
     await pool.connect(id);
   } catch (err) {
     const { code, msg } = classifyConnectFailure(err);
-    throwIpcError(code, msg);
+    throwIpcError(code, redactHostLocalPaths(host.config, msg) ?? msg);
   }
 }
 
@@ -606,6 +607,14 @@ function remoteConnectionFieldsChanged(left: HostConfig, right: HostConfig): boo
   return left.hostname !== right.hostname
     || left.port !== right.port
     || left.user !== right.user
+    || effectiveAuthenticationFingerprint(left) !== effectiveAuthenticationFingerprint(right);
+}
+
+/** Compare only fields the Settings form can write before the disk re-read. */
+function editableConnectionFieldsChanged(left: HostConfig, right: HostConfig): boolean {
+  return left.hostname !== right.hostname
+    || left.port !== right.port
+    || left.user !== right.user
     || left.authMethod !== right.authMethod
     || left.identityFile !== right.identityFile;
 }
@@ -762,7 +771,25 @@ async function ensureHydrated(): Promise<void> {
  * agentProxy (+ tunnel 实时状态) in a single round-trip instead of having
  * to call a second IPC per row.
  */
-export type HostSnapshotWithPrefs = HostSnapshot & {
+type RendererHostConfig = Pick<HostConfig,
+  | 'id'
+  | 'displayName'
+  | 'hostname'
+  | 'port'
+  | 'user'
+  | 'authMethod'
+  | 'source'
+  | 'managedByCindy'
+> & {
+  /** Renderer only needs to know whether an owned identity exists. */
+  identityFileConfigured: boolean;
+  /** Display-only basename; the absolute local path remains main-only. */
+  identityFileName?: string;
+};
+
+export type HostSnapshotWithPrefs = Omit<HostSnapshot, 'config' | 'lastError'> & {
+  config: RendererHostConfig;
+  lastError?: string;
   autoConnect: boolean;
   /** 未开启 / 未配置 → null。 */
   agentProxy: SshHostAgentProxyPref | null;
@@ -770,14 +797,55 @@ export type HostSnapshotWithPrefs = HostSnapshot & {
   agentProxyTunnel: AgentProxyTunnelState | null;
 };
 
+function portableBasename(value: string): string {
+  const index = Math.max(value.lastIndexOf('/'), value.lastIndexOf('\\'));
+  return index >= 0 ? value.slice(index + 1) : value;
+}
+
+/** Remove main-only local paths before a status or error crosses IPC. */
+function redactHostLocalPaths(config: HostConfig, message: string | undefined): string | undefined {
+  if (!message) return message;
+  const paths = [
+    config.identityFile,
+    config.sshAuthentication?.identityAgent,
+    ...(config.sshAuthentication?.configuredIdentityFiles ?? []),
+  ].filter((value): value is string => !!value && (value.includes('/') || value.includes('\\')))
+    .sort((left, right) => right.length - left.length);
+  let redacted = message;
+  for (const localPath of paths) {
+    redacted = redacted.split(localPath).join(portableBasename(localPath));
+  }
+  return redacted;
+}
+
+function toRendererHostConfig(config: HostConfig): RendererHostConfig {
+  return {
+    id: config.id,
+    ...(config.displayName !== undefined ? { displayName: config.displayName } : {}),
+    hostname: config.hostname,
+    port: config.port,
+    user: config.user,
+    authMethod: config.authMethod,
+    identityFileConfigured: config.identityFile !== undefined,
+    ...(config.identityFile !== undefined
+      ? { identityFileName: portableBasename(config.identityFile) }
+      : {}),
+    source: config.source,
+    managedByCindy: config.managedByCindy,
+  };
+}
+
 function withPrefs(snapshot: HostSnapshot): HostSnapshotWithPrefs {
   const id = snapshot.config.id;
   return {
     ...snapshot,
     config: {
-      ...snapshot.config,
+      ...toRendererHostConfig(snapshot.config),
       displayName: getSshHostDisplayName(id),
     },
+    ...(snapshot.lastError
+      ? { lastError: redactHostLocalPaths(snapshot.config, snapshot.lastError) }
+      : {}),
     autoConnect: getSshHostAutoConnect(id),
     agentProxy: getSshHostAgentProxy(id),
     agentProxyTunnel: getAgentProxyTunnelState(id),
@@ -786,12 +854,12 @@ function withPrefs(snapshot: HostSnapshot): HostSnapshotWithPrefs {
 
 function currentRemoteSshListResult(): {
   hosts: HostSnapshotWithPrefs[];
-  warnings: string[];
+  warningCount: number;
   diagnostic: Pick<SshConfigDiagnostic, 'kind'> | null;
 } {
   return {
     hosts: getPool().list().map(withPrefs),
-    warnings: sshConfigWarnings,
+    warningCount: sshConfigWarnings.length,
     diagnostic: sshConfigDiagnostic ? { kind: sshConfigDiagnostic.kind } : null,
   };
 }
@@ -843,8 +911,12 @@ function normalizeAgentProxyInput(raw: unknown): SshHostAgentProxyPref | null | 
   return { enabled: true, mode: 'tunnel', localHost, localPort, remotePort: remotePortRaw };
 }
 
-function normalizeAddInput(raw: unknown): AddHostInput & {
+function normalizeAddInput(
+  raw: unknown,
+  options: { allowIdentityFileUnchanged?: boolean } = {},
+): AddHostInput & {
   displayName: string;
+  identityFileUnchanged: boolean;
   agentProxy?: SshHostAgentProxyPref | null;
 } {
   const obj = requireObject(raw, 'host');
@@ -880,10 +952,17 @@ function normalizeAddInput(raw: unknown): AddHostInput & {
   const identityFile = typeof obj.identityFile === 'string' && obj.identityFile.trim()
     ? expandHome(obj.identityFile.trim())
     : undefined;
+  const identityFileUnchanged = obj.identityFileUnchanged === true;
+  if (identityFileUnchanged && !options.allowIdentityFileUnchanged) {
+    throwIpcError('INVALID_PARAMS', 'identityFileUnchanged is only valid when updating a host');
+  }
+  if (identityFileUnchanged && identityFile !== undefined) {
+    throwIpcError('INVALID_PARAMS', 'identityFile and identityFileUnchanged are mutually exclusive');
+  }
   if (identityFile && /[\0\r\n]/.test(identityFile)) {
     throwIpcError('INVALID_PARAMS', 'identityFile must not contain NUL or line breaks');
   }
-  if (authMethod === 'key' && !identityFile) {
+  if (authMethod === 'key' && !identityFile && !identityFileUnchanged) {
     throwIpcError('INVALID_PARAMS', 'identityFile required when authMethod is "key"');
   }
   const agentProxy = normalizeAgentProxyInput(obj.agentProxy);
@@ -895,6 +974,7 @@ function normalizeAddInput(raw: unknown): AddHostInput & {
     user,
     authMethod,
     identityFile,
+    identityFileUnchanged,
     ...(agentProxy !== undefined ? { agentProxy } : {}),
   };
 }
@@ -933,6 +1013,24 @@ function throwReloadRequired(action: string, error: unknown): never {
   );
 }
 
+function patchSshHostPrefOrThrow(
+  hostId: string,
+  patch: Parameters<typeof patchSshHostPref>[1],
+): void {
+  try {
+    patchSshHostPref(hostId, patch);
+  } catch (error) {
+    log.warn('SSH host local preferences could not be saved', {
+      hostId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throwIpcError(
+      'SSH_HOST_PREFS_WRITE_FAILED',
+      'The SSH host remains available, but local display-name or Agent Proxy preferences were not saved.',
+    );
+  }
+}
+
 export function registerRemoteSshIpc(): void {
   if (registered) return;
   registered = true;
@@ -968,12 +1066,14 @@ export function registerRemoteSshIpc(): void {
     getMainHost: (hostId) => getPool().get(hostId) ?? null,
   });
 
-  ipcMain.handle(REMOTE_SSH_INVOKE.LIST, async () => {
+  ipcMain.handle(REMOTE_SSH_INVOKE.LIST, async (event) => {
+    assertTrustedAppRendererEvent(event);
     await ensureHydrated();
     return currentRemoteSshListResult();
   });
 
-  ipcMain.handle(REMOTE_SSH_INVOKE.RELOAD_CONFIG, async () => {
+  ipcMain.handle(REMOTE_SSH_INVOKE.RELOAD_CONFIG, async (event) => {
+    assertTrustedAppRendererEvent(event);
     try {
       await hydrateRemoteHosts();
     } catch (err) {
@@ -1021,7 +1121,7 @@ export function registerRemoteSshIpc(): void {
       // The managed host is already committed. Persist alias-local fields even
       // when the in-memory refresh failed so the subsequent reload does not
       // silently lose the form's display name or Agent Proxy choice.
-      patchSshHostPref(cfg.id, {
+      patchSshHostPrefOrThrow(cfg.id, {
         displayName: input.displayName,
         ...(input.agentProxy !== undefined ? { agentProxy: input.agentProxy } : {}),
       });
@@ -1046,22 +1146,27 @@ export function registerRemoteSshIpc(): void {
 
   ipcMain.handle(REMOTE_SSH_INVOKE.UPDATE, async (event, rawHost: unknown) => {
     assertTrustedAppRendererEvent(event);
-    const input = normalizeAddInput(rawHost);
+    const input = normalizeAddInput(rawHost, { allowIdentityFileUnchanged: true });
     await ensureHydrated();
     return remoteHostHydrationQueue.run(async () => {
       const existing = getPool().get(input.id);
       if (!existing) throwIpcError('SSH_HOST_NOT_FOUND', `unknown host: ${input.id}`);
+      if (input.identityFileUnchanged && !existing.config.identityFile) {
+        throwIpcError('INVALID_PARAMS', 'host has no existing identityFile to preserve');
+      }
       const cfg: HostConfig = {
         id: input.id,
         hostname: input.hostname,
         port: input.port ?? 22,
         user: input.user,
         authMethod: input.authMethod ?? 'agent',
-        identityFile: input.identityFile,
+        identityFile: input.identityFileUnchanged
+          ? existing.config.identityFile
+          : input.identityFile,
         source: 'ssh-config',
         managedByCindy: existing.config.managedByCindy,
       };
-      const connectionFieldsChanged = remoteConnectionFieldsChanged(existing.config, cfg);
+      const connectionFieldsChanged = editableConnectionFieldsChanged(existing.config, cfg);
       if (connectionFieldsChanged) {
         const latest = await readLatestSshConfigOrThrow();
         const latestHost = latest.hosts.find((host) => host.id === input.id);
@@ -1099,13 +1204,13 @@ export function registerRemoteSshIpc(): void {
         } catch (err) {
           refreshError = err;
         }
-        patchSshHostPref(cfg.id, {
+        patchSshHostPrefOrThrow(cfg.id, {
           displayName: input.displayName,
           ...(input.agentProxy !== undefined ? { agentProxy: input.agentProxy } : {}),
         });
         if (refreshError !== undefined) throwReloadRequired('主机修改', refreshError);
       } else {
-        patchSshHostPref(cfg.id, {
+        patchSshHostPrefOrThrow(cfg.id, {
           displayName: input.displayName,
           ...(input.agentProxy !== undefined ? { agentProxy: input.agentProxy } : {}),
         });
@@ -1201,10 +1306,11 @@ export function registerRemoteSshIpc(): void {
       // text (ssh-copy-id hint) verbatim so the toast matches the host-row
       // subtitle; a local identityFile ENOENT is classified off `.code`.
       const { code, msg } = classifyConnectFailure(err);
-      throwIpcError(code, msg);
+      throwIpcError(code, redactHostLocalPaths(host.config, msg) ?? msg);
     }
 
-    return { host: getPool().get(id)?.snapshot() ?? null };
+    const connected = getPool().get(id);
+    return { host: connected ? withPrefs(connected.snapshot()) : null };
   });
 
   ipcMain.handle(REMOTE_SSH_INVOKE.DISCONNECT, async (_event, args: unknown) => {
@@ -1243,7 +1349,8 @@ export function registerRemoteSshIpc(): void {
       }
     }
     await getPool().disconnect(id);
-    return { host: getPool().get(id)?.snapshot() ?? null };
+    const disconnected = getPool().get(id);
+    return { host: disconnected ? withPrefs(disconnected.snapshot()) : null };
   });
 
   // ── Phase B: agent on remote ─────────────────────────────────────────────
