@@ -68,4 +68,30 @@ describe('ConnectionPool.hydrate', () => {
 
     expect(disconnect).toHaveBeenCalledTimes(1);
   });
+
+  it('disconnects a key host when its unsupported config state changes', async () => {
+    const pool = new ConnectionPool({ logger });
+    const initial = host('lab');
+    initial.authMethod = 'key';
+    initial.identityFile = '/tmp/lab.key';
+    initial.sshAuthentication = {
+      identitiesOnly: false,
+      configuredIdentityFiles: [],
+      identityFileDirectiveSeen: false,
+      identityFileNoneSeen: false,
+    };
+    const existing = pool.add(initial);
+    const disconnect = vi.spyOn(existing, 'disconnect').mockResolvedValue();
+    const next = host('lab');
+    next.authMethod = 'key';
+    next.identityFile = '/tmp/lab.key';
+    next.sshAuthentication = {
+      ...initial.sshAuthentication,
+      unsupportedReason: 'Cindy does not evaluate a Match block that may affect this SSH host',
+    };
+
+    await pool.hydrate([next]);
+
+    expect(disconnect).toHaveBeenCalledTimes(1);
+  });
 });

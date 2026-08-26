@@ -2,9 +2,11 @@
  * OpenSSH config discovery plus Cindy's narrowly-owned config writer.
  *
  * Discovery intentionally implements only the subset Cindy consumes. Include
- * is expanded at root scope and inside a pure `Host *` block. Other Host/Match
+ * is expanded at root scope and inside a pure `Host *` block. Other Host
  * scopes are conditional, so expanding them without evaluating OpenSSH's full
- * matcher would invent aliases that `ssh <alias>` cannot actually see.
+ * matcher would invent aliases that `ssh <alias>` cannot actually see. Match
+ * blocks are never executed; if one may affect a discovered alias, that host
+ * remains visible but is marked unsupported instead of using default fields.
  */
 
 import { createHash, randomBytes } from 'node:crypto';
@@ -25,6 +27,23 @@ const MAX_INCLUDE_DEPTH = 16;
 const MAX_INCLUDE_FILES = 64;
 const MAX_INCLUDE_BYTES = 1024 * 1024;
 const AUTH_MARKER_PREFIX = '# xdt-maker:auth=';
+const MATCH_NO_ARGUMENT_CRITERIA = new Set(['all', 'canonical', 'final']);
+const MATCH_ONE_ARGUMENT_CRITERIA = new Set([
+  'command',
+  'exec',
+  'host',
+  'localaddress',
+  'localcommand',
+  'localnetwork',
+  'localport',
+  'localuser',
+  'originalhost',
+  'remoteaddress',
+  'remoteport',
+  'tagged',
+  'user',
+  'version',
+]);
 
 export interface SshConfigDiagnostic {
   path: string;
@@ -48,13 +67,20 @@ type AuthMarker = 'agent' | 'key';
 type Scope =
   | { kind: 'root' }
   | { kind: 'host'; declaration: HostDeclaration }
-  | { kind: 'match'; expression: string };
+  | { kind: 'match'; declaration: MatchDeclaration };
 
 interface HostDeclaration {
   patterns: string[];
   sourcePath: string;
   physicalPath: string;
   marker: AuthMarker | null;
+  order: number;
+}
+
+interface MatchDeclaration {
+  expression: string;
+  /** True once the block contains a directive Cindy would otherwise ignore. */
+  hasDirectives: boolean;
   order: number;
 }
 
@@ -72,6 +98,7 @@ interface WalkState {
   files: string[];
   bytes: number;
   declarations: HostDeclaration[];
+  matches: MatchDeclaration[];
   directives: DirectiveRecord[];
   warnings: string[];
   order: number;
@@ -210,6 +237,7 @@ export async function readSshConfigDetailed(
     files: [],
     bytes: 0,
     declarations: [],
+    matches: [],
     directives: [],
     warnings: [],
     order: 0,
@@ -332,10 +360,18 @@ async function walkFile(
     }
 
     if (directive.keyword === 'match') {
-      scope = { kind: 'match', expression: directive.value };
+      const declaration: MatchDeclaration = {
+        expression: directive.value,
+        hasDirectives: false,
+        order: state.order++,
+      };
+      state.matches.push(declaration);
+      scope = { kind: 'match', declaration };
       state.warnings.push(`${location}: Match is not evaluated by Cindy.`);
       continue;
     }
+
+    if (scope.kind === 'match') scope.declaration.hasDirectives = true;
 
     if (directive.keyword === 'include') {
       if (!isSupportedIncludeScope(scope)) {
@@ -428,6 +464,9 @@ async function buildHosts(
       && directive.scope.declaration === firstIntroducing
       && directive.value.toLowerCase() !== 'none')?.value;
     const marker = firstIntroducing?.marker ?? null;
+    const matchMayAffectHost = state.matches.some((declaration) =>
+      declaration.hasDirectives
+      && matchExpressionMayApplyToAlias(declaration.expression, alias));
     // Strategy B: ordinary OpenSSH hosts are Agent-first, independently of
     // whether the concrete IdentityFile lives in the main file or an Include.
     // Only Cindy's marker opts into direct private-key reads or an explicit
@@ -510,11 +549,13 @@ async function buildHosts(
       : identitiesOnly
         ? defaultIdentityPaths()
         : [];
-    let unsupportedReason = identitiesOnlyRaw !== undefined
-      && identitiesOnlyRaw.toLowerCase() !== 'yes'
-      && identitiesOnlyRaw.toLowerCase() !== 'no'
-      ? `unsupported IdentitiesOnly value: ${identitiesOnlyRaw}`
-      : undefined;
+    let unsupportedReason = matchMayAffectHost
+      ? 'Cindy does not evaluate a Match block that may affect this SSH host'
+      : identitiesOnlyRaw !== undefined
+        && identitiesOnlyRaw.toLowerCase() !== 'yes'
+        && identitiesOnlyRaw.toLowerCase() !== 'no'
+        ? `unsupported IdentitiesOnly value: ${identitiesOnlyRaw}`
+        : undefined;
     const unsupportedAgentDirectives = [
       'certificatefile',
       'pkcs11provider',
@@ -653,6 +694,53 @@ function matchesHostPattern(patterns: readonly string[], alias: string): boolean
     matched = true;
   }
   return matched;
+}
+
+/**
+ * Cindy deliberately does not execute OpenSSH Match expressions. We only
+ * prove a block cannot affect an alias when an `originalhost` criterion
+ * excludes it; every other condition remains conservatively possible.
+ * Match criteria are ANDed, so one definitely-false originalhost condition
+ * is enough to make the whole expression irrelevant to this alias.
+ */
+function matchExpressionMayApplyToAlias(expression: string, alias: string): boolean {
+  const words = splitWords(expression);
+  if (words.length === 0) return true;
+
+  for (let index = 0; index < words.length;) {
+    const criterion = words[index]!.toLowerCase();
+    if (MATCH_NO_ARGUMENT_CRITERIA.has(criterion)) {
+      index += 1;
+      continue;
+    }
+    if (!MATCH_ONE_ARGUMENT_CRITERIA.has(criterion)) return true;
+    const value = words[index + 1];
+    if (value === undefined) return true;
+    if (criterion === 'originalhost' && !matchesMatchPatternList(value, alias)) return false;
+    index += 2;
+  }
+  return true;
+}
+
+/** Match pattern-lists are comma-separated and may contain negated entries. */
+function matchesMatchPatternList(value: string, alias: string): boolean {
+  const patterns = value.split(',').filter(Boolean);
+  if (patterns.length === 0) return true;
+
+  let hasPositive = false;
+  let positiveMatched = false;
+  for (const rawPattern of patterns) {
+    const negated = rawPattern.startsWith('!');
+    const pattern = negated ? rawPattern.slice(1) : rawPattern;
+    if (!pattern) return true;
+    const matches = matchesHostPattern([pattern], alias);
+    if (negated && matches) return false;
+    if (!negated) {
+      hasPositive = true;
+      positiveMatched ||= matches;
+    }
+  }
+  return hasPositive ? positiveMatched : true;
 }
 
 function isSupportedIncludeScope(scope: Scope): boolean {

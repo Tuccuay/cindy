@@ -265,9 +265,52 @@ describe('OpenSSH config discovery', () => {
       id: 'target',
       user: os.userInfo().username,
       port: 22,
+      sshAuthentication: {
+        unsupportedReason: expect.stringContaining('does not evaluate a Match block'),
+      },
     }]);
     expect(result.warnings.filter((warning) => warning.includes('Match is not evaluated')))
       .toHaveLength(2);
+  });
+
+  it('fails closed when an applicable Match block may override the endpoint', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host target',
+      'Match originalhost target',
+      '  HostName 192.0.2.55',
+      '  User remote-user',
+      '  Port 2205',
+      '',
+    ].join('\n'));
+
+    const result = await readSshConfigDetailed(mainConfig);
+    expect(result.hosts).toMatchObject([{
+      id: 'target',
+      // The ignored Match values must never become a usable default endpoint.
+      hostname: 'target',
+      port: 22,
+      user: os.userInfo().username,
+      sshAuthentication: {
+        unsupportedReason: expect.stringContaining('does not evaluate a Match block'),
+      },
+    }]);
+  });
+
+  it('does not reject an alias definitely excluded by Match originalhost', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host target',
+      '  HostName 192.0.2.5',
+      'Match originalhost other-host',
+      '  HostName 192.0.2.55',
+      '',
+    ].join('\n'));
+
+    const hosts = await readSshConfig(mainConfig);
+    expect(hosts).toMatchObject([{
+      id: 'target',
+      hostname: '192.0.2.5',
+    }]);
+    expect(hosts[0]?.sshAuthentication?.unsupportedReason).toBeUndefined();
   });
 
   it('restores the parent Host * scope after an included file returns', async () => {

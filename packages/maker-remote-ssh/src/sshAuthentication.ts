@@ -190,7 +190,11 @@ export async function resolveAgentEndpoint(identityAgent?: string): Promise<stri
 /** Stable comparison key shared by main connections and Agent Proxy tunnels. */
 export function effectiveAuthenticationFingerprint(host: HostConfig): string {
   if (host.authMethod === 'key') {
-    return JSON.stringify({ method: 'key', identityFile: host.identityFile ?? null });
+    return JSON.stringify({
+      method: 'key',
+      identityFile: host.identityFile ?? null,
+      unsupportedReason: host.sshAuthentication?.unsupportedReason ?? null,
+    });
   }
   const metadata = host.sshAuthentication;
   const endpoint = previewAgentEndpoint(metadata?.identityAgent);

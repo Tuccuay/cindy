@@ -69,6 +69,23 @@ describe('resolveAuth key-mode identityFile handling', () => {
     const host = keyHost({ identityFile: process.cwd() });
     await expect(resolveAuth(host)).rejects.toThrow(/failed to read identityFile .*EISDIR|failed to read identityFile/);
   });
+
+  it('fails closed before reading a key when discovery marked the SSH config unsupported', async () => {
+    const host = keyHost({
+      identityFile: '/tmp/does-not-need-to-exist.key',
+      sshAuthentication: {
+        identitiesOnly: false,
+        configuredIdentityFiles: [],
+        identityFileDirectiveSeen: false,
+        identityFileNoneSeen: false,
+        unsupportedReason: 'Cindy does not evaluate a Match block that may affect this SSH host',
+      },
+    });
+
+    await expect(resolveAuth(host)).rejects.toMatchObject({
+      code: SSH_CONFIG_AUTH_UNSUPPORTED_CODE,
+    });
+  });
 });
 
 describe('resolveAuth OpenSSH agent metadata', () => {

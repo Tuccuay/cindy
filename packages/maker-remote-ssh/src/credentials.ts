@@ -65,10 +65,16 @@ export interface ResolvedAuth {
 }
 
 export async function resolveAuth(host: HostConfig): Promise<ResolvedAuth> {
+  // Discovery may retain a host in the list while marking it unsupported so
+  // the UI can explain why Cindy cannot faithfully reproduce the SSH config.
+  // This guard must run before either auth branch; otherwise a marked key host
+  // could still connect to a default endpoint after Match directives were
+  // ignored.
+  if (host.sshAuthentication?.unsupportedReason) {
+    throwUnsupported(host.sshAuthentication.unsupportedReason);
+  }
+
   if (host.authMethod === 'agent') {
-    if (host.sshAuthentication?.unsupportedReason) {
-      throwUnsupported(host.sshAuthentication.unsupportedReason);
-    }
     let endpoint: string;
     try {
       endpoint = await resolveAgentEndpoint(host.sshAuthentication?.identityAgent);
