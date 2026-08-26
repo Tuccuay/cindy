@@ -272,6 +272,51 @@ describe('OpenSSH config discovery', () => {
     });
   });
 
+  it('expands the OpenSSH tokens supported by HostName exactly once', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host tokenized',
+      '  HostName %h.%h.example.com',
+      'Host literal-percent',
+      '  HostName edge%%node.example.com',
+      'Host alias%segment',
+      '  HostName %h.example.com',
+      'Host literal%alias',
+      '',
+    ].join('\n'));
+
+    const hosts = await readSshConfig(mainConfig);
+    expect(hosts.find((item) => item.id === 'tokenized')?.hostname)
+      .toBe('tokenized.tokenized.example.com');
+    expect(hosts.find((item) => item.id === 'literal-percent')?.hostname)
+      .toBe('edge%node.example.com');
+    expect(hosts.find((item) => item.id === 'alias%segment')?.hostname)
+      .toBe('alias%segment.example.com');
+    expect(hosts.find((item) => item.id === 'literal%alias')?.hostname)
+      .toBe('literal%alias');
+  });
+
+  it.each([
+    ['an unsupported token', '%n.example.com', '%n'],
+    ['a trailing percent', 'example.com%', '%'],
+  ])('skips a host whose HostName contains %s', async (_label, hostname, token) => {
+    await fs.writeFile(mainConfig, [
+      'Host unsupported',
+      `  HostName ${hostname}`,
+      'Host usable',
+      '  HostName usable.example.com',
+      '',
+    ].join('\n'));
+
+    const result = await readSshConfigDetailed(mainConfig);
+    expect(result.hosts).toMatchObject([{
+      id: 'usable',
+      hostname: 'usable.example.com',
+    }]);
+    expect(result.warnings).toContain(
+      `SSH host "unsupported" was skipped because HostName uses unsupported token "${token}".`,
+    );
+  });
+
   it('keeps ordinary IdentityFile entries as agent metadata regardless of scope', async () => {
     await fs.writeFile(mainConfig, [
       'Host *',

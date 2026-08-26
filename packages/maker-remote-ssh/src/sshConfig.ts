@@ -111,6 +111,29 @@ export function expandHome(value: string): string {
   return value;
 }
 
+type HostNameExpansionResult =
+  | { hostname: string; unsupportedToken?: never }
+  | { hostname?: never; unsupportedToken: string };
+
+/** HostName accepts only %% and %h; expand once so alias contents are not re-read as tokens. */
+function expandHostNameTokens(value: string, alias: string): HostNameExpansionResult {
+  let hostname = '';
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index]!;
+    if (char !== '%') {
+      hostname += char;
+      continue;
+    }
+
+    const token = value[index + 1];
+    if (token === '%') hostname += '%';
+    else if (token === 'h') hostname += alias;
+    else return { unsupportedToken: token === undefined ? '%' : `%${token}` };
+    index += 1;
+  }
+  return { hostname };
+}
+
 export async function readSshConfig(
   filePath = defaultSshConfigPath(),
   options: ReadSshConfigOptions = {},
@@ -359,7 +382,18 @@ async function buildHosts(
       : marker === 'agent'
         ? introducingIdentity
         : undefined;
-    const hostname = firstMatchingDirective(state.directives, alias, 'hostname') ?? alias;
+    const hostnameRaw = firstMatchingDirective(state.directives, alias, 'hostname');
+    const hostnameExpansion = hostnameRaw === undefined
+      ? { hostname: alias }
+      : expandHostNameTokens(hostnameRaw, alias);
+    if (hostnameExpansion.unsupportedToken !== undefined) {
+      state.warnings.push(
+        `SSH host ${JSON.stringify(alias)} was skipped because HostName uses unsupported token `
+        + `${JSON.stringify(hostnameExpansion.unsupportedToken)}.`,
+      );
+      continue;
+    }
+    const hostname = hostnameExpansion.hostname;
     const user = firstMatchingDirective(state.directives, alias, 'user')
       ?? os.userInfo().username;
     const port = parseIntSafe(firstMatchingDirective(state.directives, alias, 'port'), DEFAULT_PORT);
