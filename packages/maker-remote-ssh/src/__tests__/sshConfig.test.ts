@@ -504,6 +504,49 @@ describe('OpenSSH config discovery', () => {
     }]);
   });
 
+  it('expands IdentityFile tokens from the effective host context before resolving keys', async () => {
+    const expandedIdentity = path.join(
+      scratchDir,
+      'resolved.example-deployer-2222-%-token-identity',
+    );
+    await fs.writeFile(`${expandedIdentity}.pub`, TEST_PUBLIC_KEY);
+    await fs.writeFile(mainConfig, [
+      'Host token-identity',
+      '  HostName resolved.example',
+      '  User deployer',
+      '  Port 2222',
+      '  IdentitiesOnly yes',
+      `  IdentityFile ${scratchDir}/%h-%r-%p-%%-%n`,
+      '',
+    ].join('\n'));
+
+    const [hostConfig] = await readSshConfig(mainConfig);
+    expect(hostConfig).toMatchObject({
+      id: 'token-identity',
+      sshAuthentication: {
+        identitiesOnly: true,
+        configuredIdentityFiles: [expandedIdentity],
+      },
+    });
+    expect(hostConfig?.sshAuthentication?.allowedAgentFingerprints).toHaveLength(1);
+    expect(hostConfig?.sshAuthentication?.unsupportedReason).toBeUndefined();
+  });
+
+  it('skips a host whose IdentityFile contains an unsupported token', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host unsupported-identity-token',
+      '  IdentityFile ~/.ssh/id_%f',
+      'Host usable',
+      '',
+    ].join('\n'));
+
+    const result = await readSshConfigDetailed(mainConfig);
+    expect(result.hosts.map((hostConfig) => hostConfig.id)).toEqual(['usable']);
+    expect(result.warnings).toContain(
+      'SSH host "unsupported-identity-token" was skipped because IdentityFile uses unsupported token "%f".',
+    );
+  });
+
   it('keeps a no-marker IdentityFile host on unfiltered Agent without guessing .pub', async () => {
     const labKey = path.join(scratchDir, 'lab.key');
     await fs.writeFile(labKey, 'invalid-identity-fixture');
@@ -884,6 +927,28 @@ describe('managed config writers', () => {
     expect(raw.replace(/\r\n/g, '')).not.toContain('\n');
     if (modeBefore === 0o640) {
       expect((await fs.stat(mainConfig)).mode & 0o777).toBe(modeBefore);
+    }
+  });
+
+  it('does not overwrite a concurrent edit while publishing the managed Include', async () => {
+    const original = '# original\nHost existing\n';
+    const concurrent = '# edited externally\nHost existing\n  User external\n';
+    await fs.writeFile(mainConfig, original);
+    const writeFile = fs.writeFile.bind(fs);
+    const writeSpy = vi.spyOn(fs, 'writeFile').mockImplementation(async (file, data, options) => {
+      const result = await writeFile(file, data, options);
+      if (String(file).includes('.config.cindy-')) {
+        await writeFile(mainConfig, concurrent);
+      }
+      return result;
+    });
+
+    try {
+      await expect(ensureManagedConfigInclude(mainConfig, managedConfig))
+        .rejects.toMatchObject({ code: 'SSH_CONFIG_CONCURRENT_MODIFICATION' });
+      await expect(fs.readFile(mainConfig, 'utf8')).resolves.toBe(concurrent);
+    } finally {
+      writeSpy.mockRestore();
     }
   });
 

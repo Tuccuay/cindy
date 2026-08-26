@@ -7,7 +7,7 @@
  * matcher would invent aliases that `ssh <alias>` cannot actually see.
  */
 
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -384,6 +384,8 @@ async function walkFile(
       || name === 'identityfile'
       || name === 'identitiesonly'
       || name === 'identityagent'
+      || name === 'hostkeyalias'
+      || name === 'proxyjump'
       || name === 'certificatefile'
       || name === 'pkcs11provider'
       || name === 'securitykeyprovider') {
@@ -464,9 +466,39 @@ async function buildHosts(
     const identityFileNoneSeen = identityDirectives.some(
       (directive) => directive.value.toLowerCase() === 'none',
     );
-    const explicitIdentityFiles = identityDirectives
-      .filter((directive) => directive.value.toLowerCase() !== 'none')
-      .map((directive) => expandIdentityFile(directive.value));
+    const identityContext: IdentityFileTokenContext = {
+      alias,
+      hostname,
+      user,
+      port,
+      hostKeyAlias: firstMatchingDirective(state.directives, alias, 'hostkeyalias'),
+      proxyJump: firstMatchingDirective(state.directives, alias, 'proxyjump'),
+    };
+    const concreteIdentityDirectives = identityDirectives
+      .filter((directive) => directive.value.toLowerCase() !== 'none');
+    const explicitIdentityFiles: string[] = [];
+    let unsupportedIdentityToken: string | undefined;
+    for (const directive of concreteIdentityDirectives) {
+      const expansion = expandIdentityFile(directive.value, identityContext);
+      if ('unsupportedToken' in expansion) {
+        unsupportedIdentityToken = expansion.unsupportedToken;
+        break;
+      }
+      explicitIdentityFiles.push(expansion.filePath);
+    }
+    if (unsupportedIdentityToken !== undefined) {
+      state.warnings.push(
+        `SSH host ${JSON.stringify(alias)} was skipped because IdentityFile uses unsupported token `
+        + `${JSON.stringify(unsupportedIdentityToken)}.`,
+      );
+      continue;
+    }
+    const introducingIdentityIndex = identityRaw === undefined
+      ? -1
+      : concreteIdentityDirectives.findIndex((directive) => directive.value === identityRaw);
+    const identityFile = introducingIdentityIndex >= 0
+      ? explicitIdentityFiles[introducingIdentityIndex]
+      : undefined;
     const identitiesOnlyRaw = firstMatchingDirective(
       state.directives,
       alias,
@@ -514,9 +546,7 @@ async function buildHosts(
       port,
       user,
       authMethod,
-      identityFile: identityRaw
-        ? expandIdentityFile(identityRaw)
-        : undefined,
+      identityFile,
       sshAuthentication: {
         ...(marker ? { marker } : {}),
         identitiesOnly,
@@ -707,11 +737,65 @@ function isConcreteAlias(alias: string): boolean {
     && !alias.startsWith('!');
 }
 
-function expandIdentityFile(value: string): string {
-  const expanded = expandHome(value);
+interface IdentityFileTokenContext {
+  alias: string;
+  hostname: string;
+  user: string;
+  port: number;
+  hostKeyAlias?: string;
+  proxyJump?: string;
+}
+
+type IdentityFileExpansionResult =
+  | { filePath: string }
+  | { unsupportedToken: string };
+
+/** Expand IdentityFile tokens once using the effective host connection context. */
+function expandIdentityFile(
+  value: string,
+  context: IdentityFileTokenContext,
+): IdentityFileExpansionResult {
+  const localUser = os.userInfo();
+  const localHostname = os.hostname();
+  const proxyJump = context.proxyJump ?? '';
+  const connectionHash = createHash('sha1').update(
+    `${localHostname}${context.hostname}${context.port}${context.user}${proxyJump}`,
+  ).digest('hex');
+  const replacements: Record<string, string> = {
+    '%': '%',
+    C: connectionHash,
+    d: os.homedir(),
+    h: context.hostname,
+    i: String(localUser.uid),
+    j: proxyJump,
+    k: context.hostKeyAlias ?? context.alias,
+    L: localHostname.split('.')[0] ?? localHostname,
+    l: localHostname,
+    n: context.alias,
+    p: String(context.port),
+    r: context.user,
+    u: localUser.username,
+  };
+  let expanded = '';
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index]!;
+    if (char !== '%') {
+      expanded += char;
+      continue;
+    }
+    const token = value[index + 1];
+    if (token === undefined || replacements[token] === undefined) {
+      return { unsupportedToken: token === undefined ? '%' : `%${token}` };
+    }
+    expanded += replacements[token];
+    index += 1;
+  }
+  expanded = expandHome(expanded);
   // Unlike Include, OpenSSH does not resolve a relative IdentityFile against
   // the config file directory. It remains relative to the ssh process cwd.
-  return path.isAbsolute(expanded) ? expanded : path.resolve(process.cwd(), expanded);
+  return {
+    filePath: path.isAbsolute(expanded) ? expanded : path.resolve(process.cwd(), expanded),
+  };
 }
 
 async function globPaths(pattern: string): Promise<string[]> {
@@ -815,14 +899,16 @@ export async function ensureManagedConfigInclude(
     kept[insertionIndex - 1] = `${kept[insertionIndex - 1]}${eol}`;
   }
   const next = kept.join('');
-  if (next !== existing) await writeAtomicPreservingTarget(mainConfigPath, next);
+  if (next !== existing) {
+    await writeAtomicPreservingTarget(mainConfigPath, next, existing);
+  }
 }
 
 /** Append a new, single-alias Host block to Cindy's managed file. */
 export async function addManagedHost(host: HostConfig, managedConfigPath: string): Promise<void> {
   const existing = await readRawConfig(managedConfigPath);
   const next = prepareManagedHostAdd(host, existing);
-  await writeAtomicPreservingTarget(managedConfigPath, next);
+  await writeAtomicPreservingTarget(managedConfigPath, next, existing);
 }
 
 /**
@@ -839,7 +925,7 @@ export async function addManagedHostWithInclude(
   // mutation. A malformed pre-existing cindy.conf therefore cannot be exposed
   // by a newly inserted Include.
   const next = prepareManagedHostAdd(host, existing);
-  await writeAtomicPreservingTarget(managedConfigPath, next);
+  await writeAtomicPreservingTarget(managedConfigPath, next, existing);
   try {
     await ensureManagedConfigInclude(mainConfigPath, managedConfigPath);
   } catch (includeError) {
@@ -848,7 +934,7 @@ export async function addManagedHostWithInclude(
     // are syntactically valid, so the main SSH graph is not poisoned.
     try {
       if (await readRawConfig(managedConfigPath) === next) {
-        await writeAtomicPreservingTarget(managedConfigPath, existing);
+        await writeAtomicPreservingTarget(managedConfigPath, existing, next);
       }
     } catch (rollbackError) {
       throw new AggregateError(
@@ -874,6 +960,7 @@ export async function updateManagedHostFields(
   await writeAtomicPreservingTarget(
     managedConfigPath,
     (parsed as unknown as { toString(): string }).toString(),
+    existing,
   );
 }
 
@@ -887,6 +974,7 @@ export async function removeManagedHost(alias: string, managedConfigPath: string
   await writeAtomicPreservingTarget(
     managedConfigPath,
     (parsed as unknown as { toString(): string }).toString(),
+    existing,
   );
 }
 
@@ -900,6 +988,7 @@ export async function upsertHost(host: HostConfig, filePath: string): Promise<vo
   await writeAtomicPreservingTarget(
     filePath,
     (parsed as unknown as { toString(): string }).toString(),
+    existing,
   );
 }
 
@@ -913,6 +1002,7 @@ export async function updateHostFields(host: HostConfig, filePath: string): Prom
   await writeAtomicPreservingTarget(
     filePath,
     (parsed as unknown as { toString(): string }).toString(),
+    existing,
   );
 }
 
@@ -924,6 +1014,7 @@ export async function removeHost(alias: string, filePath: string): Promise<void>
   await writeAtomicPreservingTarget(
     filePath,
     (parsed as unknown as { toString(): string }).toString(),
+    existing,
   );
 }
 
@@ -1165,7 +1256,11 @@ async function readRawConfig(filePath: string): Promise<string> {
   }
 }
 
-async function writeAtomicPreservingTarget(filePath: string, content: string): Promise<void> {
+async function writeAtomicPreservingTarget(
+  filePath: string,
+  content: string,
+  expectedContent: string,
+): Promise<void> {
   const requested = path.resolve(filePath);
   let target = requested;
   let existingMode: number | undefined;
@@ -1194,6 +1289,13 @@ async function writeAtomicPreservingTarget(filePath: string, content: string): P
   try {
     await fs.writeFile(tempPath, content, { flag: 'wx', mode: existingMode ?? 0o600 });
     if (existingMode !== undefined) await fs.chmod(tempPath, existingMode);
+    if (await readRawConfig(target) !== expectedContent) {
+      const conflict = new Error(
+        'SSH config changed while Cindy was preparing an update; retry the operation.',
+      ) as Error & { code?: string };
+      conflict.code = 'SSH_CONFIG_CONCURRENT_MODIFICATION';
+      throw conflict;
+    }
     await fs.rename(tempPath, target);
   } catch (error) {
     await fs.unlink(tempPath).catch(() => undefined);
