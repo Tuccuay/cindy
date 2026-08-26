@@ -255,16 +255,55 @@ describe('remote SSH mutation runtime semantics', () => {
     await getRemoteSshPool().hydrate([current]);
     const live = getRemoteSshPool().get(current.id)!;
     const disconnect = vi.spyOn(live, 'disconnect').mockResolvedValue();
-    mocks.updateManagedHostFields.mockRejectedValueOnce(new Error('disk full'));
+    mocks.updateManagedHostFields.mockRejectedValueOnce(
+      new Error('EACCES: cannot write /Users/example/.ssh/cindy.conf'),
+    );
 
-    await expect(handler(REMOTE_SSH_INVOKE.UPDATE)({}, {
+    const error = await handler(REMOTE_SSH_INVOKE.UPDATE)({}, {
       ...current,
       hostname: '192.0.2.99',
       displayName: current.id,
-    })).rejects.toMatchObject({ code: 'SSH_CONFIG_IO_FAILED' });
+    }).catch((caught) => caught);
+
+    expect(error).toMatchObject({ code: 'SSH_CONFIG_IO_FAILED' });
+    expect(error.message).not.toContain('/Users/example/.ssh/cindy.conf');
 
     expect(disconnect).not.toHaveBeenCalled();
     expect(live.config.hostname).toBe(current.hostname);
+  });
+
+  it.each([
+    ['a thrown filesystem error', () => {
+      mocks.readSshConfigDetailed.mockRejectedValueOnce(
+        new Error('EACCES: cannot read /Users/example/.ssh/config'),
+      );
+    }],
+    ['a returned diagnostic', () => {
+      mocks.readSshConfigDetailed.mockResolvedValueOnce({
+        hosts: [],
+        diagnostic: {
+          path: '/Users/example/.ssh/included.conf',
+          kind: 'io',
+          message: 'EACCES: cannot read /Users/example/.ssh/included.conf',
+          recoveryHint: 'fix permissions',
+        },
+        warnings: [],
+      });
+    }],
+  ])('does not expose local paths when config preflight returns %s', async (_label, failRead) => {
+    const current = host('private-path');
+    await getRemoteSshPool().hydrate([current]);
+    failRead();
+
+    const error = await handler(REMOTE_SSH_INVOKE.UPDATE)({}, {
+      ...current,
+      hostname: '192.0.2.199',
+      displayName: current.id,
+    }).catch((caught) => caught);
+
+    expect(error).toMatchObject({ code: 'SSH_CONFIG_IO_FAILED' });
+    expect(error.message).not.toContain('/Users/example');
+    expect(error.message).not.toContain('EACCES');
   });
 
   it('keeps existing aliases connected when ADD writes but refresh fails', async () => {

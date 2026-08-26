@@ -244,6 +244,10 @@ const remoteHostHydrationQueue = new RemoteHostHydrationQueue();
 let sshConfigWarnings: string[] = [];
 let sshConfigDiagnostic: SshConfigDiagnostic | null = null;
 let remoteFileBrowserEndpointInvalidator: ((hostId: string) => Promise<void>) | null = null;
+const SSH_CONFIG_READ_FAILED_MESSAGE =
+  'Unable to read SSH configuration. Check file permissions and Include paths, then refresh.';
+const SSH_CONFIG_WRITE_FAILED_MESSAGE =
+  'Unable to write SSH configuration. Check file permissions, then try again.';
 /** 与 pool 共享的 host-key store — agent-proxy 隧道专用连接也用它做 TOFU 校验。 */
 let sharedHostKeyStore: FileHostKeyStore | null = null;
 
@@ -632,12 +636,22 @@ async function readLatestSshConfigOrThrow(): Promise<ReadSshConfigResult> {
       message: error instanceof Error ? error.message : String(error),
       recoveryHint: 'Check SSH config permissions and Include paths, then refresh.',
     };
-    throwIpcError('SSH_CONFIG_IO_FAILED', `read SSH config failed: ${sshConfigDiagnostic.message}`);
+    log.warn('failed to read SSH config before mutation', {
+      path: sshConfigDiagnostic.path,
+      kind: sshConfigDiagnostic.kind,
+      error: sshConfigDiagnostic.message,
+    });
+    throwIpcError('SSH_CONFIG_IO_FAILED', SSH_CONFIG_READ_FAILED_MESSAGE);
   }
   sshConfigWarnings = result.warnings;
   if (result.diagnostic) {
     sshConfigDiagnostic = result.diagnostic;
-    throwIpcError('SSH_CONFIG_IO_FAILED', `read SSH config failed: ${result.diagnostic.message}`);
+    log.warn('SSH config diagnostic before mutation', {
+      path: result.diagnostic.path,
+      kind: result.diagnostic.kind,
+      error: result.diagnostic.message,
+    });
+    throwIpcError('SSH_CONFIG_IO_FAILED', SSH_CONFIG_READ_FAILED_MESSAGE);
   }
   sshConfigDiagnostic = null;
   return result;
@@ -1007,9 +1021,13 @@ async function assertHostHasNoSessionReferences(
 }
 
 function throwReloadRequired(action: string, error: unknown): never {
+  log.warn('SSH config mutation committed but refresh failed', {
+    action,
+    error: error instanceof Error ? error.message : String(error),
+  });
   throwIpcError(
     'SSH_CONFIG_RELOAD_REQUIRED',
-    `${action}已写入 SSH 配置，但 Cindy 刷新失败；请重新加载 SSH 配置: ${error instanceof Error ? error.message : String(error)}`,
+    `${action}已写入 SSH 配置，但 Cindy 刷新失败；请重新加载 SSH 配置。`,
   );
 }
 
@@ -1107,7 +1125,8 @@ export function registerRemoteSshIpc(): void {
       try {
         await addManagedHostWithInclude(cfg, sshConfigPath, managedSshConfigPath);
       } catch (err) {
-        throwIpcError('SSH_CONFIG_IO_FAILED', `write SSH config failed: ${String(err)}`);
+        log.warn('failed to write SSH config while adding host', { error: String(err) });
+        throwIpcError('SSH_CONFIG_IO_FAILED', SSH_CONFIG_WRITE_FAILED_MESSAGE);
       }
       let refreshError: unknown;
       try {
@@ -1193,7 +1212,8 @@ export function registerRemoteSshIpc(): void {
         } catch (err) {
           // The live connection remains untouched until the managed write has
           // committed successfully.
-          throwIpcError('SSH_CONFIG_IO_FAILED', `update SSH config failed: ${String(err)}`);
+          log.warn('failed to write SSH config while updating host', { error: String(err) });
+          throwIpcError('SSH_CONFIG_IO_FAILED', SSH_CONFIG_WRITE_FAILED_MESSAGE);
         }
         try {
           if (existing.getStatus() === 'ready') {
@@ -1251,7 +1271,8 @@ export function registerRemoteSshIpc(): void {
       try {
         await removeManagedHost(id, managedSshConfigPath);
       } catch (err) {
-        throwIpcError('SSH_CONFIG_IO_FAILED', `remove SSH config host failed: ${String(err)}`);
+        log.warn('failed to write SSH config while removing host', { error: String(err) });
+        throwIpcError('SSH_CONFIG_IO_FAILED', SSH_CONFIG_WRITE_FAILED_MESSAGE);
       }
       try {
         if (host.getStatus() === 'ready') {

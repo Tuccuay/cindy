@@ -111,6 +111,58 @@ export function expandHome(value: string): string {
   return value;
 }
 
+type IncludePathExpansionResult =
+  | { pattern: string; warning?: never }
+  | { pattern?: never; warning: string };
+
+/** Expand the environment and home-directory forms accepted by OpenSSH Include. */
+function expandIncludePath(value: string): IncludePathExpansionResult {
+  let pattern = '';
+  let cursor = 0;
+  while (cursor < value.length) {
+    const start = value.indexOf('${', cursor);
+    if (start < 0) {
+      pattern += value.slice(cursor);
+      break;
+    }
+    pattern += value.slice(cursor, start);
+    const end = value.indexOf('}', start + 2);
+    if (end < 0) {
+      return { warning: 'malformed environment variable expression; Include was not expanded.' };
+    }
+    const name = value.slice(start + 2, end);
+    if (!name || name.includes('{')) {
+      return { warning: 'malformed environment variable expression; Include was not expanded.' };
+    }
+    const environmentValue = process.env[name];
+    if (environmentValue === undefined) {
+      return {
+        warning: `environment variable "${name}" is not set; Include was not expanded.`,
+      };
+    }
+    pattern += environmentValue;
+    cursor = end + 1;
+  }
+
+  const currentUserPattern = /^~([^/\\]+)(?:[/\\](.*))?$/.exec(pattern);
+  if (currentUserPattern) {
+    const username = currentUserPattern[1]!;
+    if (username !== os.userInfo().username) {
+      return {
+        warning: `home directory for user "${username}" cannot be resolved by Cindy; Include was not expanded.`,
+      };
+    }
+    const remainder = currentUserPattern[2];
+    return {
+      pattern: remainder === undefined
+        ? os.homedir()
+        : path.join(os.homedir(), remainder.replace(/\\/g, '/')),
+    };
+  }
+
+  return { pattern: expandHome(pattern) };
+}
+
 type HostNameExpansionResult =
   | { hostname: string; unsupportedToken?: never }
   | { hostname?: never; unsupportedToken: string };
@@ -291,13 +343,18 @@ async function walkFile(
         continue;
       }
       for (const patternValue of splitWords(directive.value)) {
-        const expanded = expandHome(patternValue);
+        const expansion = expandIncludePath(patternValue);
+        if ('warning' in expansion) {
+          state.warnings.push(`${location}: ${expansion.warning}`);
+          continue;
+        }
+        const expanded = expansion.pattern;
         const absolutePattern = path.isAbsolute(expanded)
           ? expanded
           : path.resolve(state.rootDir, expanded);
         for (const includedPath of await globPaths(absolutePattern)) {
           const includedComparable = await comparablePath(includedPath);
-          const repeatedManagedGlob = hasGlob(patternValue)
+          const repeatedManagedGlob = hasGlob(expanded)
             && state.managedComparable !== null
             && state.visited.has(includedComparable)
             && pathsEqual(includedComparable, state.managedComparable);
@@ -1017,7 +1074,9 @@ async function isSingleExactInclude(
 ): Promise<boolean> {
   const patterns = splitWords(value);
   if (patterns.length !== 1 || hasGlob(patterns[0]!)) return false;
-  const expanded = expandHome(patterns[0]!);
+  const expansion = expandIncludePath(patterns[0]!);
+  if ('warning' in expansion) return false;
+  const expanded = expansion.pattern;
   const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(configDir, expanded);
   return pathsEqual(await comparablePath(resolved), await comparablePath(managedConfigPath));
 }

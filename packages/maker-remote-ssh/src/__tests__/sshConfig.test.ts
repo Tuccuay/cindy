@@ -155,6 +155,68 @@ describe('OpenSSH config discovery', () => {
     }]);
   });
 
+  it('expands environment variables in Include paths', async () => {
+    const includeDir = path.join(scratchDir, 'environment-config.d');
+    await fs.mkdir(includeDir);
+    await fs.writeFile(mainConfig, 'Include ${CINDY_TEST_SSH_CONF_DIR}/*.conf\n');
+    await fs.writeFile(path.join(includeDir, 'environment.conf'), [
+      'Host environment-include',
+      '  HostName 192.0.2.31',
+      '',
+    ].join('\n'));
+    const previous = process.env.CINDY_TEST_SSH_CONF_DIR;
+    process.env.CINDY_TEST_SSH_CONF_DIR = includeDir;
+
+    try {
+      await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
+        id: 'environment-include',
+        hostname: '192.0.2.31',
+      }]);
+    } finally {
+      if (previous === undefined) delete process.env.CINDY_TEST_SSH_CONF_DIR;
+      else process.env.CINDY_TEST_SSH_CONF_DIR = previous;
+    }
+  });
+
+  it('expands the current user name in Include home-directory paths', async () => {
+    const homeSpy = vi.spyOn(os, 'homedir').mockReturnValue(scratchDir);
+    try {
+      const includeDir = path.join(scratchDir, '.ssh', 'named-user-config.d');
+      await fs.mkdir(includeDir, { recursive: true });
+      await fs.writeFile(
+        mainConfig,
+        `Include ~${os.userInfo().username}/.ssh/named-user-config.d/*.conf\n`,
+      );
+      await fs.writeFile(path.join(includeDir, 'named-user.conf'), [
+        'Host named-user-include',
+        '  HostName 192.0.2.32',
+        '',
+      ].join('\n'));
+
+      await expect(readSshConfig(mainConfig)).resolves.toMatchObject([{
+        id: 'named-user-include',
+        hostname: '192.0.2.32',
+      }]);
+    } finally {
+      homeSpy.mockRestore();
+    }
+  });
+
+  it.each([
+    ['an unset environment variable', 'Include ${CINDY_TEST_MISSING_SSH_DIR}/*.conf', 'is not set'],
+    ['another user home', 'Include ~cindy-review-user-that-does-not-exist/.ssh/*.conf', 'cannot be resolved'],
+    ['a malformed environment expression', 'Include ${CINDY_TEST_SSH_DIR/*.conf', 'malformed'],
+  ])('warns and skips Include with %s', async (_label, includeLine, warning) => {
+    delete process.env.CINDY_TEST_MISSING_SSH_DIR;
+    await fs.writeFile(mainConfig, `${includeLine}\nHost usable\n  HostName 192.0.2.33\n`);
+
+    const result = await readSshConfigDetailed(mainConfig);
+    expect(result.hosts).toMatchObject([{ id: 'usable', hostname: '192.0.2.33' }]);
+    expect(result.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining(warning),
+    ]));
+  });
+
   it.each(['Include config.d/*', '  Include config.d/*'])(
     'expands Include inside a pure Host * block regardless of indentation: %s',
     async (includeLine) => {
