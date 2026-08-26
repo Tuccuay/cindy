@@ -28,6 +28,9 @@ function snapshot(partial: {
   hostname?: string;
   status?: SshHostSnapshotLike['status'];
   lastError?: string;
+  identityFile?: string;
+  identityAgent?: string;
+  configuredIdentityFiles?: string[];
 }): SshHostSnapshotLike {
   return {
     config: {
@@ -36,6 +39,17 @@ function snapshot(partial: {
       port: 22,
       user: 'deploy',
       authMethod: 'agent',
+      ...(partial.identityFile ? { identityFile: partial.identityFile } : {}),
+      ...(partial.identityAgent || partial.configuredIdentityFiles
+        ? {
+            sshAuthentication: {
+              ...(partial.identityAgent ? { identityAgent: partial.identityAgent } : {}),
+              ...(partial.configuredIdentityFiles
+                ? { configuredIdentityFiles: partial.configuredIdentityFiles }
+                : {}),
+            },
+          }
+        : {}),
       source: 'manual',
     },
     status: partial.status ?? 'ready',
@@ -139,6 +153,30 @@ describe('ssh_list_hosts', () => {
       status: 'ready',
     });
     expect(hosts[1]).toMatchObject({ id: 'db-1', status: 'failed', lastError: 'boom' });
+  });
+
+  it('redacts local credential paths from model-visible host errors', async () => {
+    const identityFile = '/Users/alice/.ssh/client-prod';
+    const identityAgent = String.raw`C:\Users\alice\.ssh\agent.sock`;
+    const { pool } = makeFakePool([
+      snapshot({
+        id: 'private-paths',
+        status: 'failed',
+        identityFile,
+        identityAgent,
+        configuredIdentityFiles: [identityFile],
+        lastError: `IdentityFile ${identityFile} failed via ${identityAgent}`,
+      }),
+    ]);
+    const { deps } = makeDeps(pool);
+    const { payload } = await callParsed(makeRegistry(deps), 'ssh_list_hosts', {});
+
+    const [listed] = payload.hosts as Array<Record<string, unknown>>;
+    expect(listed.lastError).toBe(
+      'IdentityFile <identity-file> failed via <identity-agent>',
+    );
+    expect(JSON.stringify(payload)).not.toContain('alice');
+    expect(JSON.stringify(payload)).not.toContain('client-prod');
   });
 
   it('empty pool returns ok with guidance hint', async () => {
@@ -369,6 +407,29 @@ describe('ssh_exec', () => {
     expect(isError).toBe(true);
     expect(payload.errorCode).toBe(code);
     expect(String((payload.data as Record<string, unknown>).hint)).toContain('重复');
+  });
+
+  it('redacts local credential paths from ensureReady errors', async () => {
+    const identityFile = '/Users/alice/.ssh/client-prod';
+    const host = snapshot({ id: 'web-1', identityFile });
+    const { pool } = makeFakePool([host]);
+    const { deps } = makeDeps(pool, {
+      ensureReady: async () => {
+        throw new Error(
+          `[SSH_CONFIG_AUTH_UNSUPPORTED] IdentityFile ${identityFile} has no public key`,
+        );
+      },
+    });
+    const { payload, rawText } = await callParsed(makeRegistry(deps), 'ssh_exec', {
+      host: 'web-1',
+      command: 'true',
+    });
+
+    expect(payload.errorCode).toBe('SSH_CONFIG_AUTH_UNSUPPORTED');
+    expect(String((payload.data as Record<string, unknown>).hint))
+      .toContain('IdentityFile <identity-file> has no public key');
+    expect(rawText).not.toContain('alice');
+    expect(rawText).not.toContain('client-prod');
   });
 
   it('unprefixed unknown error falls back to SSH_CONNECT_FAILED', async () => {

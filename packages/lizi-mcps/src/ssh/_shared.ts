@@ -63,8 +63,28 @@ export function hostBrief(s: SshHostSnapshotLike): Record<string, unknown> {
     authMethod: s.config.authMethod,
     status: s.status,
     ...(s.lastAuthLabel ? { lastAuthLabel: s.lastAuthLabel } : {}),
-    ...(s.lastError ? { lastError: s.lastError } : {}),
+    ...(s.lastError ? { lastError: redactHostLocalPaths(s, s.lastError) } : {}),
   };
+}
+
+/** Replace main-only credential paths before a host snapshot becomes model-visible. */
+function redactHostLocalPaths(snapshot: SshHostSnapshotLike, message: string): string {
+  const replacements = [
+    { value: snapshot.config.identityFile, replacement: '<identity-file>' },
+    {
+      value: snapshot.config.sshAuthentication?.identityAgent,
+      replacement: '<identity-agent>',
+    },
+    ...(snapshot.config.sshAuthentication?.configuredIdentityFiles ?? [])
+      .map((value) => ({ value, replacement: '<identity-file>' })),
+  ].filter(({ value }) => value?.includes('/') || value?.includes('\\'))
+    .sort((left, right) => right.value!.length - left.value!.length);
+
+  let redacted = message;
+  for (const { value, replacement } of replacements) {
+    redacted = redacted.split(value!).join(replacement);
+  }
+  return redacted;
 }
 
 export type ResolveHostResult =
@@ -157,10 +177,15 @@ export interface ClassifiedSshError {
 /**
  * best-effort 分类 deps.ensureReady / host.exec 抛出的错误。
  * 认证失败的 message 内含 authFailureHint 的可操作提示（如 ssh-copy-id 指引），
- * 原样透传进 hint 让 agent 转告用户——认证失败是确定性的，不要重试。
+ * 去掉 main-only 凭证路径后透传进 hint 让 agent 转告用户——认证失败是确定性的，
+ * 不要重试。
  */
-export function classifySshError(err: unknown): ClassifiedSshError {
-  const message = err instanceof Error ? err.message : String(err);
+export function classifySshError(
+  err: unknown,
+  snapshot?: SshHostSnapshotLike,
+): ClassifiedSshError {
+  const rawMessage = err instanceof Error ? err.message : String(err);
+  const message = snapshot ? redactHostLocalPaths(snapshot, rawMessage) : rawMessage;
 
   if (EXEC_TIMEOUT_RE.test(message)) {
     return {

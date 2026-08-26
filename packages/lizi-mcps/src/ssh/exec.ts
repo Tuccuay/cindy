@@ -104,7 +104,7 @@ export function registerSshExecTool(
         });
       } catch (err) {
         // 不回显 command 原文，只落 host + 分类结果。
-        const classified = classifySshError(err);
+        const classified = classifySshError(err, resolved.snapshot);
         deps.logger?.warn?.(
           `[cindy_ssh] ssh_exec on "${hostId}" failed: ${classified.errorCode}`,
         );
