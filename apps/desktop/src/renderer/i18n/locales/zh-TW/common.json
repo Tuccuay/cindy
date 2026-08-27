@@ -12,7 +12,7 @@
     "DEVICE_LINK_DEVICE_UNRESPONSIVE": "目標裝置長時間無響應，請檢查遠端裝置後重試",
     "INTERNAL": "操作失敗，請稍後重試。",
     "SSH_CONFIG_RELOAD_REQUIRED": "SSH 設定已儲存，但 Cindy 重新整理失敗。請重新載入 SSH 設定。",
-    "SSH_CONFIG_AUTH_UNSUPPORTED": "此主機使用了 Cindy 暫時無法完整重現的 SSH 驗證設定。終端 SSH 仍可能成功；請檢查 IdentityAgent、IdentitiesOnly 與公開金鑰檔案。",
+    "SSH_CONFIG_AUTH_UNSUPPORTED": "Cindy 無法安全重現此主機的部分 SSH 設定規則。終端 SSH 仍可能成功；請檢查 Match、條件式 Include、IdentityAgent、IdentitiesOnly 與公開金鑰設定。",
     "SSH_AGENT_UNAVAILABLE": "SSH Agent 目前無法使用。請啟動 SSH Agent，並用 ssh-add 載入對應私密金鑰後再試。",
     "SSH_HOST_PREFS_WRITE_FAILED": "主機仍已儲存，但顯示名稱或 Agent Proxy 設定未能儲存。請檢查本機儲存權限後再試。",
     "REMOTE_WORKDIR_INVALID": "遠端專案目錄無效，請重新選擇專案目錄。",

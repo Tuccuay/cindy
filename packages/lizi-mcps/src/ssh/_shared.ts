@@ -224,7 +224,7 @@ export function classifySshError(
     case 'SSH_CONFIG_AUTH_UNSUPPORTED':
       return {
         errorCode: 'SSH_CONFIG_AUTH_UNSUPPORTED',
-        hint: `此主机的 SSH 认证配置超出 Cindy 当前支持的子集（重复连接无效，终端 SSH 仍可能成功）：${detail}。请检查 IdentityAgent、IdentitiesOnly 和公钥文件。`,
+        hint: `此主机的部分 SSH 配置规则超出 Cindy 当前支持的子集（重复连接无效，终端 SSH 仍可能成功）：${detail}。请检查 Match、条件 Include、IdentityAgent、IdentitiesOnly 和公钥设置。`,
       };
     default:
       return {

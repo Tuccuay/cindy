@@ -4,9 +4,10 @@
  * Discovery intentionally implements only the subset Cindy consumes. Include
  * is expanded at root scope and inside a pure `Host *` block. Other Host
  * scopes are conditional, so expanding them without evaluating OpenSSH's full
- * matcher would invent aliases that `ssh <alias>` cannot actually see. Match
- * blocks are never executed; if one may affect a discovered alias, that host
- * remains visible but is marked unsupported instead of using default fields.
+ * matcher would invent aliases that `ssh <alias>` cannot actually see. If a
+ * skipped conditional Include or an unevaluated Match may affect a discovered
+ * alias, that host remains visible but is marked unsupported instead of using
+ * default fields.
  */
 
 import { createHash, randomBytes } from 'node:crypto';
@@ -92,6 +93,11 @@ interface MatchDeclaration {
   order: number;
 }
 
+interface SkippedConditionalInclude {
+  /** Host scope whose effective directives may come from the skipped Include. */
+  scope: Extract<Scope, { kind: 'host' }>;
+}
+
 interface DirectiveRecord {
   name: string;
   value: string;
@@ -107,6 +113,7 @@ interface WalkState {
   bytes: number;
   declarations: HostDeclaration[];
   matches: MatchDeclaration[];
+  skippedConditionalIncludes: SkippedConditionalInclude[];
   directives: DirectiveRecord[];
   warnings: string[];
   order: number;
@@ -246,6 +253,7 @@ export async function readSshConfigDetailed(
     bytes: 0,
     declarations: [],
     matches: [],
+    skippedConditionalIncludes: [],
     directives: [],
     warnings: [],
     order: 0,
@@ -383,6 +391,9 @@ async function walkFile(
 
     if (directive.keyword === 'include') {
       if (!isSupportedIncludeScope(scope)) {
+        if (scope.kind === 'host') {
+          state.skippedConditionalIncludes.push({ scope });
+        }
         state.warnings.push(`${location}: conditional Include was not expanded.`);
         continue;
       }
@@ -475,6 +486,9 @@ async function buildHosts(
     const matchMayAffectHost = state.matches.some((declaration) =>
       declaration.hasDirectives
       && matchExpressionMayApplyToAlias(declaration.expression, alias));
+    const conditionalIncludeMayAffectHost = state.skippedConditionalIncludes.some(
+      ({ scope }) => scopeMatches(scope, alias),
+    );
     // Strategy B: ordinary OpenSSH hosts are Agent-first, independently of
     // whether the concrete IdentityFile lives in the main file or an Include.
     // Only Cindy's marker opts into direct private-key reads or an explicit
@@ -559,11 +573,13 @@ async function buildHosts(
         : [];
     let unsupportedReason = matchMayAffectHost
       ? 'Cindy does not evaluate a Match block that may affect this SSH host'
-      : identitiesOnlyRaw !== undefined
-        && identitiesOnlyRaw.toLowerCase() !== 'yes'
-        && identitiesOnlyRaw.toLowerCase() !== 'no'
-        ? `unsupported IdentitiesOnly value: ${identitiesOnlyRaw}`
-        : undefined;
+      : conditionalIncludeMayAffectHost
+        ? 'Cindy does not expand a conditional Include that may affect this SSH host'
+        : identitiesOnlyRaw !== undefined
+          && identitiesOnlyRaw.toLowerCase() !== 'yes'
+          && identitiesOnlyRaw.toLowerCase() !== 'no'
+          ? `unsupported IdentitiesOnly value: ${identitiesOnlyRaw}`
+          : undefined;
     const unsupportedAgentDirectives = [
       'certificatefile',
       'pkcs11provider',

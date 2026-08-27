@@ -234,19 +234,60 @@ describe('OpenSSH config discovery', () => {
     },
   );
 
-  it('does not expand Include in a concrete Host block and returns a warning', async () => {
+  it('fails closed when a concrete Host block depends on a conditional Include', async () => {
     await fs.writeFile(mainConfig, [
-      'Host outer',
-      'Include conditional.conf',
+      'Host prod',
+      '  Include conditional.conf',
       '',
     ].join('\n'));
-    await fs.writeFile(path.join(scratchDir, 'conditional.conf'), 'Host ghost\n');
+    await fs.writeFile(path.join(scratchDir, 'conditional.conf'), [
+      'HostName 192.0.2.55',
+      'User deploy',
+      'Port 2205',
+      '',
+    ].join('\n'));
 
     const result = await readSshConfigDetailed(mainConfig);
-    expect(result.hosts.map((item) => item.id)).toEqual(['outer']);
+    expect(result.hosts).toMatchObject([{
+      id: 'prod',
+      // Ignored conditional values must never become a usable default endpoint.
+      hostname: 'prod',
+      user: os.userInfo().username,
+      port: 22,
+      sshAuthentication: {
+        unsupportedReason: expect.stringContaining('conditional Include'),
+      },
+    }]);
     expect(result.warnings).toEqual(expect.arrayContaining([
       expect.stringContaining('conditional Include was not expanded'),
     ]));
+  });
+
+  it('fails closed only for aliases matched by a conditional Host scope', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host * !safe',
+      '  Include conditional.conf',
+      'Host safe',
+      '  HostName safe.example.com',
+      'Host risky',
+      '  HostName risky.example.com',
+      '',
+    ].join('\n'));
+    await fs.writeFile(path.join(scratchDir, 'conditional.conf'), 'Port 2205\n');
+
+    const hosts = await readSshConfig(mainConfig);
+    const safe = hosts.find((host) => host.id === 'safe');
+    const risky = hosts.find((host) => host.id === 'risky');
+    expect(safe).toMatchObject({
+      hostname: 'safe.example.com',
+    });
+    expect(safe?.sshAuthentication?.unsupportedReason).toBeUndefined();
+    expect(risky).toMatchObject({
+      hostname: 'risky.example.com',
+      sshAuthentication: {
+        unsupportedReason: expect.stringContaining('conditional Include'),
+      },
+    });
   });
 
   it('does not evaluate Match blocks or Match exec', async () => {

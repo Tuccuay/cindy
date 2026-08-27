@@ -407,6 +407,9 @@ describe('ssh_exec', () => {
     expect(isError).toBe(true);
     expect(payload.errorCode).toBe(code);
     expect(String((payload.data as Record<string, unknown>).hint)).toContain('重复');
+    if (code === 'SSH_CONFIG_AUTH_UNSUPPORTED') {
+      expect(String((payload.data as Record<string, unknown>).hint)).toContain('条件 Include');
+    }
   });
 
   it('redacts local credential paths from ensureReady errors', async () => {
