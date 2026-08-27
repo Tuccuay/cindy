@@ -8,6 +8,7 @@ import {
   addManagedHostWithInclude,
   ensureManagedConfigInclude,
   expandHome,
+  MANAGED_CONFIG_MARKER,
   readSshConfig,
   readSshConfigDetailed,
   removeManagedHost,
@@ -883,10 +884,18 @@ describe('OpenSSH config discovery', () => {
 describe('managed ownership', () => {
   it('marks only a unique single-alias declaration in the supplied managed file', async () => {
     await fs.writeFile(mainConfig, `Include ${managedConfig}\n`);
-    await fs.writeFile(managedConfig, 'Host managed\n  HostName 192.0.2.20\n');
+    await fs.writeFile(managedConfig, `${MANAGED_CONFIG_MARKER}\nHost managed\n  HostName 192.0.2.20\n`);
 
     await expect(readSshConfig(mainConfig, { managedConfigPath: managedConfig }))
       .resolves.toMatchObject([{ id: 'managed', source: 'ssh-config', managedByCindy: true }]);
+  });
+
+  it('does not treat a host-block comment as a managed-file ownership marker', async () => {
+    await fs.writeFile(mainConfig, `Include ${managedConfig}\n`);
+    await fs.writeFile(managedConfig, 'Host user-owned\n  # xdt-maker:managed=v1\n');
+
+    await expect(readSshConfig(mainConfig, { managedConfigPath: managedConfig }))
+      .resolves.toMatchObject([{ id: 'user-owned', managedByCindy: false }]);
   });
 
   it('keeps managed aliases read-only when duplicated in any other file', async () => {
@@ -1083,7 +1092,7 @@ describe('managed config writers', () => {
       }]);
 
     await removeManagedHost('new-host', managedConfig);
-    await expect(fs.readFile(managedConfig, 'utf8')).resolves.toBe('');
+    await expect(fs.readFile(managedConfig, 'utf8')).resolves.toBe(`${MANAGED_CONFIG_MARKER}\n`);
   });
 
   it('quotes managed IdentityFile values without losing spaces, hashes, quotes, or backslashes', async () => {
@@ -1108,15 +1117,35 @@ describe('managed config writers', () => {
   it('does not publish an Include for a malformed pre-existing managed file', async () => {
     const originalMain = 'Host external\n  HostName 192.0.2.50\n';
     await fs.writeFile(mainConfig, originalMain);
-    await fs.writeFile(managedConfig, 'Host broken\n  IdentityFile "unterminated\n');
+    await fs.writeFile(managedConfig, `${MANAGED_CONFIG_MARKER}\nHost broken\n  IdentityFile "unterminated\n`);
 
     await expect(addManagedHostWithInclude(host({ id: 'new-host' }), mainConfig, managedConfig))
       .rejects.toThrow();
     await expect(fs.readFile(mainConfig, 'utf8')).resolves.toBe(originalMain);
   });
 
+  it('does not claim a non-empty unmarked managed path', async () => {
+    const originalMain = 'Host external\n  HostName 192.0.2.50\n';
+    const unownedManaged = 'Host user-owned\n  HostName 192.0.2.51\n';
+    await fs.writeFile(mainConfig, originalMain);
+    await fs.writeFile(managedConfig, unownedManaged);
+
+    await expect(addManagedHostWithInclude(host({ id: 'new-host' }), mainConfig, managedConfig))
+      .rejects.toMatchObject({ code: 'SSH_CONFIG_OWNERSHIP_REQUIRED' });
+    await expect(fs.readFile(mainConfig, 'utf8')).resolves.toBe(originalMain);
+    await expect(fs.readFile(managedConfig, 'utf8')).resolves.toBe(unownedManaged);
+  });
+
+  it('stamps a newly created managed file with its ownership marker', async () => {
+    await fs.writeFile(mainConfig, '');
+
+    await addManagedHostWithInclude(host({ id: 'new-host' }), mainConfig, managedConfig);
+
+    await expect(fs.readFile(managedConfig, 'utf8')).resolves.toMatch(/^# xdt-maker:managed=v1\n/);
+  });
+
   it('restores managed bytes when publishing the Include fails', async ({ skip }) => {
-    const originalManaged = 'Host existing\n  HostName 192.0.2.60\n';
+    const originalManaged = `${MANAGED_CONFIG_MARKER}\nHost existing\n  HostName 192.0.2.60\n`;
     await fs.writeFile(managedConfig, originalManaged);
     try {
       await fs.symlink(path.join(scratchDir, 'missing-main-target'), mainConfig);
@@ -1133,7 +1162,7 @@ describe('managed config writers', () => {
   });
 
   it('returns a conditional rollback receipt for a published managed host', async () => {
-    const originalManaged = 'Host existing\n  HostName 192.0.2.60\n';
+    const originalManaged = `${MANAGED_CONFIG_MARKER}\nHost existing\n  HostName 192.0.2.60\n`;
     await fs.writeFile(mainConfig, '');
     await fs.writeFile(managedConfig, originalManaged);
 
@@ -1148,7 +1177,7 @@ describe('managed config writers', () => {
   });
 
   it('does not roll back over an external managed-file edit', async () => {
-    const originalManaged = 'Host existing\n  HostName 192.0.2.60\n';
+    const originalManaged = `${MANAGED_CONFIG_MARKER}\nHost existing\n  HostName 192.0.2.60\n`;
     await fs.writeFile(mainConfig, '');
     await fs.writeFile(managedConfig, originalManaged);
 
@@ -1187,8 +1216,53 @@ describe('managed config writers', () => {
       }]);
   });
 
+  it.each(['ProxyJump bastion', 'ProxyCommand ssh -W %h:%p bastion'])
+    ('marks an unsupported SSH transport directive as unsupported: %s', async (directive) => {
+      await fs.writeFile(mainConfig, [
+        `Host proxied-${directive.startsWith('ProxyJump') ? 'jump' : 'command'}`,
+        `  ${directive}`,
+        '',
+      ].join('\n'));
+
+      const [hostConfig] = await readSshConfig(mainConfig);
+      expect(hostConfig?.sshAuthentication?.unsupportedReason).toContain('transport');
+    });
+
+  it('treats ProxyJump/ProxyCommand none as disabled transport directives', async () => {
+    await fs.writeFile(mainConfig, [
+      'Host direct',
+      '  ProxyJump none',
+      '  ProxyCommand none',
+      '',
+    ].join('\n'));
+
+    const [hostConfig] = await readSshConfig(mainConfig);
+    expect(hostConfig?.id).toBe('direct');
+    expect(hostConfig?.sshAuthentication?.unsupportedReason).toBeUndefined();
+  });
+
+  it('fails closed when a wildcard scope supplies an unsupported proxy transport', async () => {
+    await fs.mkdir(path.join(scratchDir, 'config.d'));
+    await fs.writeFile(mainConfig, [
+      'Host *',
+      '  ProxyJump bastion',
+      'Include config.d/*',
+      '',
+    ].join('\n'));
+    await fs.writeFile(path.join(scratchDir, 'config.d', 'remote.conf'), [
+      'Host remote',
+      '  HostName 192.0.2.80',
+      '',
+    ].join('\n'));
+
+    const [hostConfig] = await readSshConfig(mainConfig);
+    expect(hostConfig?.id).toBe('remote');
+    expect(hostConfig?.sshAuthentication?.unsupportedReason).toContain('proxyjump');
+  });
+
   it('surgically updates owned fields without deleting ProxyJump or other directives', async () => {
     await fs.writeFile(managedConfig, [
+      MANAGED_CONFIG_MARKER,
       'Host lab',
       '  HostName 192.0.2.30',
       '  User alice',
@@ -1216,6 +1290,7 @@ describe('managed config writers', () => {
 
   it('preserves CRLF and permissions while updating a managed host', async () => {
     await fs.writeFile(managedConfig, [
+      MANAGED_CONFIG_MARKER,
       'Host lab',
       '  HostName 192.0.2.40',
       '  User alice',

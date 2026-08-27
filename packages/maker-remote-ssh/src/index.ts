@@ -114,6 +114,8 @@ export {
   updateHostFields,
   removeHost,
   expandHome,
+  MANAGED_CONFIG_MARKER,
+  MANAGED_CONFIG_OWNERSHIP_REQUIRED_CODE,
 } from './sshConfig.js';
 export type {
   ManagedHostAddReceipt,

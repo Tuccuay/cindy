@@ -39,6 +39,7 @@ import {
   pushRemoteCodexAuth,
   expandHome,
   effectiveAuthenticationFingerprint,
+  MANAGED_CONFIG_OWNERSHIP_REQUIRED_CODE,
   FileHostKeyStore,
   RemoteHost,
   type AddHostInput,
@@ -1143,6 +1144,12 @@ export function registerRemoteSshIpc(): void {
         addReceipt = await addManagedHostWithInclude(cfg, sshConfigPath, managedSshConfigPath);
       } catch (err) {
         log.warn('failed to write SSH config while adding host', { error: String(err) });
+        if ((err as { code?: string }).code === MANAGED_CONFIG_OWNERSHIP_REQUIRED_CODE) {
+          throwIpcError(
+            'SSH_CONFIG_OWNERSHIP_REQUIRED',
+            'The existing Cindy SSH config is not owned by Cindy; add the ownership marker or choose another file.',
+          );
+        }
         throwIpcError('SSH_CONFIG_IO_FAILED', SSH_CONFIG_WRITE_FAILED_MESSAGE);
       }
       let refreshError: unknown;
@@ -1255,6 +1262,12 @@ export function registerRemoteSshIpc(): void {
           // The live connection remains untouched until the managed write has
           // committed successfully.
           log.warn('failed to write SSH config while updating host', { error: String(err) });
+          if ((err as { code?: string }).code === MANAGED_CONFIG_OWNERSHIP_REQUIRED_CODE) {
+            throwIpcError(
+              'SSH_CONFIG_OWNERSHIP_REQUIRED',
+              'The existing Cindy SSH config is not owned by Cindy; add the ownership marker or choose another file.',
+            );
+          }
           throwIpcError('SSH_CONFIG_IO_FAILED', SSH_CONFIG_WRITE_FAILED_MESSAGE);
         }
         try {
@@ -1314,6 +1327,12 @@ export function registerRemoteSshIpc(): void {
         await removeManagedHost(id, managedSshConfigPath);
       } catch (err) {
         log.warn('failed to write SSH config while removing host', { error: String(err) });
+        if ((err as { code?: string }).code === MANAGED_CONFIG_OWNERSHIP_REQUIRED_CODE) {
+          throwIpcError(
+            'SSH_CONFIG_OWNERSHIP_REQUIRED',
+            'The existing Cindy SSH config is not owned by Cindy; add the ownership marker or choose another file.',
+          );
+        }
         throwIpcError('SSH_CONFIG_IO_FAILED', SSH_CONFIG_WRITE_FAILED_MESSAGE);
       }
       try {

@@ -386,6 +386,19 @@ describe('remote SSH mutation runtime semantics', () => {
     expect(getRemoteSshPool().get(added.id)?.config.id).toBe(added.id);
   });
 
+  it('reports an ownership error when the existing managed SSH file is unclaimed', async () => {
+    const ownershipError = new Error('existing managed SSH config is not owned by Cindy') as Error & { code?: string };
+    ownershipError.code = 'SSH_CONFIG_OWNERSHIP_REQUIRED';
+    mocks.addManagedHostWithInclude.mockRejectedValueOnce(ownershipError);
+
+    await expect(handler(REMOTE_SSH_INVOKE.ADD)({}, {
+      id: 'unclaimed-file',
+      hostname: '192.0.2.73',
+      user: 'developer',
+    })).rejects.toMatchObject({ code: 'SSH_CONFIG_OWNERSHIP_REQUIRED' });
+    expect(mocks.patchPref).not.toHaveBeenCalled();
+  });
+
   it('reports a stable local-prefs error instead of a raw filesystem failure on UPDATE', async () => {
     const external = host('prefs-only', { managedByCindy: false });
     await getRemoteSshPool().hydrate([external]);

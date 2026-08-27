@@ -28,6 +28,9 @@ const MAX_INCLUDE_DEPTH = 16;
 const MAX_INCLUDE_FILES = 64;
 const MAX_INCLUDE_BYTES = 1024 * 1024;
 const AUTH_MARKER_PREFIX = '# xdt-maker:auth=';
+/** File-level marker proving that Cindy created/owns the managed config. */
+export const MANAGED_CONFIG_MARKER = '# xdt-maker:managed=v1';
+export const MANAGED_CONFIG_OWNERSHIP_REQUIRED_CODE = 'SSH_CONFIG_OWNERSHIP_REQUIRED';
 const MATCH_NO_ARGUMENT_CRITERIA = new Set(['all', 'canonical', 'final']);
 const MATCH_ONE_ARGUMENT_CRITERIA = new Set([
   'command',
@@ -114,6 +117,7 @@ interface WalkState {
   declarations: HostDeclaration[];
   matches: MatchDeclaration[];
   skippedConditionalIncludes: SkippedConditionalInclude[];
+  managedConfigOwned: boolean;
   directives: DirectiveRecord[];
   warnings: string[];
   order: number;
@@ -254,6 +258,7 @@ export async function readSshConfigDetailed(
     declarations: [],
     matches: [],
     skippedConditionalIncludes: [],
+    managedConfigOwned: false,
     directives: [],
     warnings: [],
     order: 0,
@@ -341,6 +346,9 @@ async function walkFile(
   state.visited.add(physicalPath);
   state.files.push(physicalPath);
   state.bytes += bytes;
+  if (state.managedComparable !== null && pathsEqual(physicalPath, state.managedComparable)) {
+    state.managedConfigOwned = hasManagedConfigMarker(raw);
+  }
 
   let scope = inheritedScope;
   const lines = raw.split(/\r?\n/);
@@ -441,6 +449,7 @@ async function walkFile(
       || name === 'identityagent'
       || name === 'hostkeyalias'
       || name === 'proxyjump'
+      || name === 'proxycommand'
       || name === 'certificatefile'
       || name === 'pkcs11provider'
       || name === 'securitykeyprovider') {
@@ -522,6 +531,7 @@ async function buildHosts(
       && introducing.length === 1
       && firstIntroducing?.patterns.length === 1
       && pathsEqual(firstIntroducing.physicalPath, managedComparable);
+    const managedOwnership = uniquelyManaged && state.managedConfigOwned;
 
     const identityFileDirectiveSeen = identityDirectives.length > 0;
     const identityFileNoneSeen = identityDirectives.some(
@@ -580,6 +590,14 @@ async function buildHosts(
           && identitiesOnlyRaw.toLowerCase() !== 'no'
           ? `unsupported IdentitiesOnly value: ${identitiesOnlyRaw}`
           : undefined;
+    const unsupportedTransportDirectives = ['proxyjump', 'proxycommand']
+      .filter((name) => {
+        const value = firstMatchingDirective(state.directives, alias, name);
+        return value !== undefined && value.toLowerCase() !== 'none';
+      });
+    if (unsupportedTransportDirectives.length > 0) {
+      unsupportedReason ??= `Cindy does not support ${unsupportedTransportDirectives.join(' / ')} transport configuration`;
+    }
     const unsupportedAgentDirectives = [
       'certificatefile',
       'pkcs11provider',
@@ -625,7 +643,7 @@ async function buildHosts(
         ...(unsupportedReason ? { unsupportedReason } : {}),
       },
       source: 'ssh-config' as const,
-      managedByCindy: uniquelyManaged,
+      managedByCindy: managedOwnership,
     });
   }
   return hosts;
@@ -837,6 +855,11 @@ function parseAuthMarker(comment: string): AuthMarker | null {
   return null;
 }
 
+function hasManagedConfigMarker(raw: string): boolean {
+  const firstContentLine = raw.split(/\r?\n/).find((line) => line.trim() !== '');
+  return firstContentLine?.trim() === MANAGED_CONFIG_MARKER;
+}
+
 function isCanonicalizationDirective(keyword: string): boolean {
   return keyword.startsWith('canonicalize') || keyword === 'canonicaldomains';
 }
@@ -963,6 +986,8 @@ export async function ensureManagedConfigInclude(
   mainConfigPath: string,
   managedConfigPath: string,
 ): Promise<void> {
+  const managedExisting = await readRawConfig(managedConfigPath);
+  if (managedExisting) assertManagedConfigOwnership(managedExisting);
   const existing = await readRawConfig(mainConfigPath);
   const eol = existing.includes('\r\n') ? '\r\n' : '\n';
   const lines = splitLinesKeepingEndings(existing);
@@ -1033,6 +1058,7 @@ export async function addManagedHostWithInclude(
   managedConfigPath: string,
 ): Promise<ManagedHostAddReceipt> {
   const existing = await readRawConfig(managedConfigPath);
+  assertManagedConfigOwnership(existing);
   // Parse and serialize the complete next file before publishing either disk
   // mutation. A malformed pre-existing cindy.conf therefore cannot be exposed
   // by a newly inserted Include.
@@ -1065,6 +1091,7 @@ export async function updateManagedHostFields(
   managedConfigPath: string,
 ): Promise<void> {
   const existing = await readRawConfig(managedConfigPath);
+  assertManagedConfigOwnership(existing);
   if (!existing) throw new Error(`managed SSH host not found: ${host.id}`);
   const parsed = SSHConfig.parse(existing) as SshConfigSection[];
   const section = findSingleHostSection(parsed, host.id);
@@ -1079,6 +1106,7 @@ export async function updateManagedHostFields(
 
 export async function removeManagedHost(alias: string, managedConfigPath: string): Promise<void> {
   const existing = await readRawConfig(managedConfigPath);
+  assertManagedConfigOwnership(existing);
   if (!existing) return;
   const parsed = SSHConfig.parse(existing) as SshConfigSection[];
   const matches = parsed.filter((section) => isSingleAliasHostSection(section, alias));
@@ -1257,18 +1285,31 @@ function formatHostBlock(host: HostConfig, eol: string): string {
 }
 
 function prepareManagedHostAdd(host: HostConfig, existing: string): string {
-  const parsed = SSHConfig.parse(existing) as SshConfigSection[];
+  const ownedExisting = assertManagedConfigOwnership(existing);
+  const parsed = SSHConfig.parse(ownedExisting) as SshConfigSection[];
   if (findAnyHostSection(parsed, host.id)) {
     throw new Error(`host already exists in managed SSH config: ${host.id}`);
   }
   const eol = existing.includes('\r\n') ? '\r\n' : '\n';
   const separator = existing && !existing.endsWith('\n') && !existing.endsWith('\r') ? eol : '';
-  const next = `${existing}${separator}${formatHostBlock(host, eol)}`;
+  const next = `${ownedExisting}${separator}${formatHostBlock(host, eol)}`;
   // The package parser is also the syntax gate used by discovery. Reparse the
   // exact bytes that will be written so escaping changes cannot publish an
   // unreadable managed file.
   SSHConfig.parse(next);
   return next;
+}
+
+function assertManagedConfigOwnership(existing: string): string {
+  if (!existing.trim()) return `${MANAGED_CONFIG_MARKER}\n`;
+  if (!hasManagedConfigMarker(existing)) {
+    const error = new Error(
+      'existing managed SSH config is not owned by Cindy; add the Cindy ownership marker or choose another file',
+    ) as Error & { code?: string };
+    error.code = MANAGED_CONFIG_OWNERSHIP_REQUIRED_CODE;
+    throw error;
+  }
+  return existing;
 }
 
 async function isSingleExactInclude(
