@@ -1267,6 +1267,15 @@ export function RemoteSection({ showTitle = true }: { showTitle?: boolean } = {}
       toast.success(t('settings.remote.toast.added'));
     } catch (err) {
       const code = extractIpcError(err)?.code;
+      if (code === 'PRECONDITION_FAILED') {
+        // The main process rejected a concurrent SSH-config ownership change.
+        // Re-read the graph so the conflicting alias is visible before the
+        // user retries; this is not a committed mutation and must not close
+        // the add form or show a success toast.
+        await reloadCommittedMutationOnce();
+        toast.error(t('settings.remote.toast.addConflict'));
+        return;
+      }
       const prefsWriteFailed = code === 'SSH_HOST_PREFS_WRITE_FAILED';
       const recovered = (code === 'SSH_CONFIG_RELOAD_REQUIRED' || prefsWriteFailed)
         && await reloadCommittedMutationOnce();

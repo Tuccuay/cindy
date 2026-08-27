@@ -48,6 +48,7 @@ import {
   type SshConfigDiagnostic,
   type InstallProgressEvent,
   type InstallResult,
+  type ManagedHostAddReceipt,
   type ReadSshConfigResult,
   type RemoteAgentKind,
 } from '@cindy/maker-remote-ssh';
@@ -248,6 +249,14 @@ const SSH_CONFIG_READ_FAILED_MESSAGE =
   'Unable to read SSH configuration. Check file permissions and Include paths, then refresh.';
 const SSH_CONFIG_WRITE_FAILED_MESSAGE =
   'Unable to write SSH configuration. Check file permissions, then try again.';
+
+class SshHostOwnershipConflictError extends Error {
+  constructor(readonly aliases: readonly string[]) {
+    super(`SSH host ownership changed while adding: ${aliases.join(', ')}`);
+    this.name = 'SshHostOwnershipConflictError';
+  }
+}
+
 /** 与 pool 共享的 host-key store — agent-proxy 隧道专用连接也用它做 TOFU 校验。 */
 let sharedHostKeyStore: FileHostKeyStore | null = null;
 
@@ -720,6 +729,7 @@ async function invalidateHostRuntimeState(hostId: string): Promise<void> {
 async function hydrateRemoteHostsUnqueued(
   alreadyInvalidated: ReadonlySet<string> = new Set(),
   preserveExistingEndpoints = false,
+  requiredManagedAliases: ReadonlySet<string> = new Set(),
 ): Promise<void> {
   let result: ReadSshConfigResult;
   try {
@@ -743,6 +753,12 @@ async function hydrateRemoteHostsUnqueued(
   sshConfigDiagnostic = null;
 
   const nextById = new Map(result.hosts.map((host) => [host.id, host]));
+  const ownershipConflicts = Array.from(requiredManagedAliases).filter(
+    (alias) => nextById.get(alias)?.managedByCindy !== true,
+  );
+  if (ownershipConflicts.length > 0) {
+    throw new SshHostOwnershipConflictError(ownershipConflicts);
+  }
   const changedOrRemoved: string[] = [];
   for (const current of getPool().list()) {
     const next = nextById.get(current.config.id);
@@ -1122,8 +1138,9 @@ export function registerRemoteSshIpc(): void {
         source: 'ssh-config',
         managedByCindy: true,
       };
+      let addReceipt: ManagedHostAddReceipt;
       try {
-        await addManagedHostWithInclude(cfg, sshConfigPath, managedSshConfigPath);
+        addReceipt = await addManagedHostWithInclude(cfg, sshConfigPath, managedSshConfigPath);
       } catch (err) {
         log.warn('failed to write SSH config while adding host', { error: String(err) });
         throwIpcError('SSH_CONFIG_IO_FAILED', SSH_CONFIG_WRITE_FAILED_MESSAGE);
@@ -1132,9 +1149,34 @@ export function registerRemoteSshIpc(): void {
       try {
         // ADD must not disconnect or repoint any existing alias. If an external
         // editor changed one concurrently, keep the old pool and ask for an
-        // explicit reload; the newly-added block remains safely on disk.
-        await hydrateRemoteHostsUnqueued(new Set(), true);
+        // explicit reload. A collision on the newly-added alias is handled
+        // separately and conditionally rolls back Cindy's staged block.
+        await hydrateRemoteHostsUnqueued(new Set(), true, new Set([cfg.id]));
       } catch (err) {
+        if (err instanceof SshHostOwnershipConflictError) {
+          let rolledBack = false;
+          let rollbackError: unknown;
+          try {
+            rolledBack = await addReceipt.rollback();
+          } catch (error) {
+            rollbackError = error;
+          }
+          log.warn('SSH host ownership changed while adding', {
+            hostId: cfg.id,
+            rolledBack,
+            ...(rollbackError !== undefined
+              ? {
+                  rollbackError: rollbackError instanceof Error
+                    ? rollbackError.message
+                    : String(rollbackError),
+                }
+              : {}),
+          });
+          throwIpcError(
+            'PRECONDITION_FAILED',
+            'SSH configuration changed while adding the host; reload it and try again.',
+          );
+        }
         refreshError = err;
       }
       // The managed host is already committed. Persist alias-local fields even

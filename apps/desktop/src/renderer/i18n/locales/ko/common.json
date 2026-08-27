@@ -381,6 +381,7 @@
         "reloaded": "~/.ssh/config 를 다시 읽었습니다",
         "loadFailed": "원격 머신 로드 실패",
         "addFailed": "머신 추가 실패",
+        "addConflict": "머신을 추가하는 동안 SSH 설정이 변경되었습니다. 설정을 다시 불러온 뒤 호스트 항목을 확인하고 다시 시도하세요.",
         "connectFailed": "연결 실패",
         "disconnectFailed": "끊기 실패",
         "removeFailed": "제거 실패",

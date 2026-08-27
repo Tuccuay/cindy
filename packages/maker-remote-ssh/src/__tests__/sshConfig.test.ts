@@ -1091,6 +1091,38 @@ describe('managed config writers', () => {
     expect((await fs.lstat(mainConfig)).isSymbolicLink()).toBe(true);
   });
 
+  it('returns a conditional rollback receipt for a published managed host', async () => {
+    const originalManaged = 'Host existing\n  HostName 192.0.2.60\n';
+    await fs.writeFile(mainConfig, '');
+    await fs.writeFile(managedConfig, originalManaged);
+
+    const receipt = await addManagedHostWithInclude(
+      host({ id: 'new-host' }),
+      mainConfig,
+      managedConfig,
+    );
+    expect(await fs.readFile(managedConfig, 'utf8')).not.toBe(originalManaged);
+    await expect(receipt.rollback()).resolves.toBe(true);
+    await expect(fs.readFile(managedConfig, 'utf8')).resolves.toBe(originalManaged);
+  });
+
+  it('does not roll back over an external managed-file edit', async () => {
+    const originalManaged = 'Host existing\n  HostName 192.0.2.60\n';
+    await fs.writeFile(mainConfig, '');
+    await fs.writeFile(managedConfig, originalManaged);
+
+    const receipt = await addManagedHostWithInclude(
+      host({ id: 'new-host' }),
+      mainConfig,
+      managedConfig,
+    );
+    await fs.appendFile(managedConfig, '# external edit\n');
+
+    await expect(receipt.rollback()).resolves.toBe(false);
+    await expect(fs.readFile(managedConfig, 'utf8')).resolves.toContain('# external edit');
+    await expect(fs.readFile(managedConfig, 'utf8')).resolves.toContain('Host new-host');
+  });
+
   it('keeps an unpinned managed agent host as agent when Host * supplies a key', async () => {
     await fs.writeFile(mainConfig, [
       'Host *',

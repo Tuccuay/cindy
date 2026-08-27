@@ -381,6 +381,7 @@
         "reloaded": "~/.ssh/config を再読み込みしました",
         "loadFailed": "リモートマシンの読み込みに失敗",
         "addFailed": "マシンの追加に失敗",
+        "addConflict": "マシンの追加中に SSH 設定が変更されました。設定を再読み込みし、ホスト項目を確認してから再試行してください。",
         "connectFailed": "接続に失敗",
         "disconnectFailed": "切断に失敗",
         "removeFailed": "削除に失敗",

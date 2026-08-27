@@ -381,6 +381,7 @@
         "reloaded": "已重新读取 ~/.ssh/config",
         "loadFailed": "加载远端机器失败",
         "addFailed": "添加机器失败",
+        "addConflict": "添加期间 SSH 配置发生了变化。请重新加载配置，检查该主机条目后再试。",
         "connectFailed": "连接失败",
         "disconnectFailed": "断开失败",
         "removeFailed": "移除失败",

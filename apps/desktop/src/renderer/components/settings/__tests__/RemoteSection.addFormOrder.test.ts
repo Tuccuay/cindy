@@ -42,7 +42,9 @@ describe('RemoteSection add form order', () => {
     expect(source).toContain('setConfigDiagnostic(res.diagnostic?.kind ?? null)');
     expect(source).toContain('settings.remote.configDiagnostic.${configDiagnostic}');
     expect(source).toContain('const reloadCommittedMutationOnce = useCallback');
-    expect(source.match(/await reloadCommittedMutationOnce\(\)/g)).toHaveLength(3);
+    expect(source.match(/await reloadCommittedMutationOnce\(\)/g)).toHaveLength(4);
+    expect(source).toContain("code === 'PRECONDITION_FAILED'");
+    expect(source).toContain("t('settings.remote.toast.addConflict')");
     expect(source).toContain("code === 'SSH_HOST_PREFS_WRITE_FAILED'");
     expect(source).toContain('(prefsWriteFailed && connectionFieldsChanged)');
     expect(source).toContain("t('ipcError.SSH_HOST_PREFS_WRITE_FAILED')");

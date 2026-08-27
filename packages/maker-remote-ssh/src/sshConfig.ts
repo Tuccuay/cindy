@@ -63,6 +63,14 @@ export interface ReadSshConfigResult {
   warnings: string[];
 }
 
+/**
+ * Conditional rollback for a host that was successfully published to the
+ * managed SSH file. The rollback refuses to overwrite later external edits.
+ */
+export interface ManagedHostAddReceipt {
+  rollback(): Promise<boolean>;
+}
+
 type AuthMarker = 'agent' | 'key';
 type Scope =
   | { kind: 'root' }
@@ -1007,7 +1015,7 @@ export async function addManagedHostWithInclude(
   host: HostConfig,
   mainConfigPath: string,
   managedConfigPath: string,
-): Promise<void> {
+): Promise<ManagedHostAddReceipt> {
   const existing = await readRawConfig(managedConfigPath);
   // Parse and serialize the complete next file before publishing either disk
   // mutation. A malformed pre-existing cindy.conf therefore cannot be exposed
@@ -1021,9 +1029,7 @@ export async function addManagedHostWithInclude(
     // If it did change, preserving that external edit is safer; both versions
     // are syntactically valid, so the main SSH graph is not poisoned.
     try {
-      if (await readRawConfig(managedConfigPath) === next) {
-        await writeAtomicPreservingTarget(managedConfigPath, existing, next);
-      }
+      await restoreManagedConfigIfUnchanged(managedConfigPath, next, existing);
     } catch (rollbackError) {
       throw new AggregateError(
         [includeError, rollbackError],
@@ -1032,6 +1038,9 @@ export async function addManagedHostWithInclude(
     }
     throw includeError;
   }
+  return {
+    rollback: () => restoreManagedConfigIfUnchanged(managedConfigPath, next, existing),
+  };
 }
 
 /** Update only Cindy-owned connection fields and preserve all other directives. */
@@ -1387,6 +1396,21 @@ async function writeAtomicPreservingTarget(
     await fs.rename(tempPath, target);
   } catch (error) {
     await fs.unlink(tempPath).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function restoreManagedConfigIfUnchanged(
+  managedConfigPath: string,
+  publishedContent: string,
+  previousContent: string,
+): Promise<boolean> {
+  if (await readRawConfig(managedConfigPath) !== publishedContent) return false;
+  try {
+    await writeAtomicPreservingTarget(managedConfigPath, previousContent, publishedContent);
+    return true;
+  } catch (error) {
+    if ((error as { code?: string }).code === 'SSH_CONFIG_CONCURRENT_MODIFICATION') return false;
     throw error;
   }
 }

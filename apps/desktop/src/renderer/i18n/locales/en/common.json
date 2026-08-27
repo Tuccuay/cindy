@@ -381,6 +381,7 @@
         "reloaded": "Reloaded ~/.ssh/config",
         "loadFailed": "Failed to load remote machines",
         "addFailed": "Failed to add machine",
+        "addConflict": "The SSH configuration changed while adding this machine. Reload it, review the host entry, and try again.",
         "connectFailed": "Connection failed",
         "disconnectFailed": "Disconnect failed",
         "removeFailed": "Remove failed",

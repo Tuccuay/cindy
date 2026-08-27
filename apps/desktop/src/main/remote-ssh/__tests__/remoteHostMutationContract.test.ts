@@ -61,7 +61,7 @@ describe('remote SSH managed-host mutation contract', () => {
   it('does not disconnect existing aliases when an add write or refresh fails', () => {
     const body = handlerBody('ADD', 'UPDATE');
     const hostWrite = body.indexOf('await addManagedHostWithInclude(');
-    const hydrate = body.indexOf('await hydrateRemoteHostsUnqueued(new Set(), true);');
+    const hydrate = body.indexOf('await hydrateRemoteHostsUnqueued(new Set(), true, new Set([cfg.id]));');
     const reloadError = body.indexOf("throwReloadRequired('新主机'");
 
     expect(hostWrite).toBeGreaterThan(-1);
@@ -70,6 +70,25 @@ describe('remote SSH managed-host mutation contract', () => {
     expect(body).not.toContain('invalidateHostRuntimeState(');
     expect(body).not.toContain('.disconnect(');
     expect(source).toContain('if (preserveExistingEndpoints && changedOrRemoved.length > 0)');
+  });
+
+  it('checks ownership before publishing a hydrated pool and rolls back add conflicts', () => {
+    const hydrateSource = source.slice(
+      source.indexOf('async function hydrateRemoteHostsUnqueued('),
+      source.indexOf('function hydrateRemoteHosts()', source.indexOf('async function hydrateRemoteHostsUnqueued(')),
+    );
+    const ownershipCheck = hydrateSource.indexOf('requiredManagedAliases');
+    const poolPublish = hydrateSource.indexOf('await getPool().hydrate(result.hosts);');
+    expect(ownershipCheck).toBeGreaterThan(-1);
+    expect(ownershipCheck).toBeLessThan(poolPublish);
+
+    const body = handlerBody('ADD', 'UPDATE');
+    const hydrate = body.indexOf('await hydrateRemoteHostsUnqueued(new Set(), true, new Set([cfg.id]));');
+    const rollback = body.indexOf('await addReceipt.rollback();');
+    const prefs = body.indexOf('patchSshHostPrefOrThrow(cfg.id');
+    expect(rollback).toBeGreaterThan(hydrate);
+    expect(rollback).toBeLessThan(prefs);
+    expect(body).toContain('instanceof SshHostOwnershipConflictError');
   });
 
   it('rejects external connection-field edits and writes before invalidating an owned endpoint', () => {

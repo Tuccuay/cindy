@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   handlers: new Map<string, (...args: any[]) => Promise<unknown> | unknown>(),
   readSshConfigDetailed: vi.fn(),
   addManagedHostWithInclude: vi.fn(),
+  rollbackAdd: vi.fn(),
   updateManagedHostFields: vi.fn(),
   removeManagedHost: vi.fn(),
   patchPref: vi.fn(),
@@ -166,7 +167,8 @@ beforeAll(async () => {
 beforeEach(async () => {
   vi.clearAllMocks();
   mocks.readSshConfigDetailed.mockReset();
-  mocks.addManagedHostWithInclude.mockResolvedValue(undefined);
+  mocks.rollbackAdd.mockReset().mockResolvedValue(true);
+  mocks.addManagedHostWithInclude.mockResolvedValue({ rollback: mocks.rollbackAdd });
   mocks.updateManagedHostFields.mockResolvedValue(undefined);
   mocks.removeManagedHost.mockResolvedValue(undefined);
   mocks.invalidateMcpEndpoint.mockReset();
@@ -327,6 +329,41 @@ describe('remote SSH mutation runtime semantics', () => {
     expect(mocks.patchPref).toHaveBeenCalledWith('new-host', {
       displayName: 'new-host',
     });
+  });
+
+  it('rejects an ADD when the newly introduced alias is no longer Cindy-owned', async () => {
+    const conflicting = host('new-host', { managedByCindy: false });
+    mocks.readSshConfigDetailed
+      .mockResolvedValueOnce(successfulRead([]))
+      .mockResolvedValueOnce(successfulRead([conflicting]));
+
+    await expect(handler(REMOTE_SSH_INVOKE.ADD)({}, {
+      id: conflicting.id,
+      hostname: conflicting.hostname,
+      user: conflicting.user,
+    })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+
+    expect(mocks.rollbackAdd).toHaveBeenCalledOnce();
+    expect(mocks.patchPref).not.toHaveBeenCalled();
+    expect(getRemoteSshPool().get(conflicting.id)).toBeUndefined();
+  });
+
+  it('does not report ADD success when the managed-file rollback cannot be confirmed', async () => {
+    const conflicting = host('rollback-unknown', { managedByCindy: false });
+    mocks.rollbackAdd.mockResolvedValueOnce(false);
+    mocks.readSshConfigDetailed
+      .mockResolvedValueOnce(successfulRead([]))
+      .mockResolvedValueOnce(successfulRead([conflicting]));
+
+    await expect(handler(REMOTE_SSH_INVOKE.ADD)({}, {
+      id: conflicting.id,
+      hostname: conflicting.hostname,
+      user: conflicting.user,
+    })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+
+    expect(mocks.rollbackAdd).toHaveBeenCalledOnce();
+    expect(mocks.patchPref).not.toHaveBeenCalled();
+    expect(getRemoteSshPool().get(conflicting.id)).toBeUndefined();
   });
 
   it('reports a stable partial-success code when ADD commits but local prefs cannot be written', async () => {

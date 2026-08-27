@@ -116,6 +116,7 @@ export {
   expandHome,
 } from './sshConfig.js';
 export type {
+  ManagedHostAddReceipt,
   ReadSshConfigOptions,
   ReadSshConfigResult,
   SshConfigDiagnostic,
