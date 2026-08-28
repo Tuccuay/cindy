@@ -351,6 +351,8 @@ export class RemoteHost {
    * from the previous endpoint cannot publish status or resurrect a session.
    */
   private connectionEpoch = 0;
+  /** The currently running connect attempt, including reconnect attempts. */
+  private inFlightConnect: Promise<void> | null = null;
   /** true = user explicitly asked to disconnect; suppress auto-reconnect. */
   private userDisconnected = false;
   private events = new EventEmitter();
@@ -423,10 +425,15 @@ export class RemoteHost {
   async connect(): Promise<void> {
     if (this.status === 'ready') return;
     if (this.status === 'connecting' || this.status === 'authenticating') {
-      // Wait for the in-flight attempt to settle (success or fail). After
-      // the await `this.status` is mutated; TS still has the pre-await
-      // narrowing, so we re-read through `getStatus()`.
-      await this.waitForTerminal();
+      // Share the actual in-flight attempt instead of waiting only for a
+      // future status event. A disconnect can invalidate an attempt after it
+      // has emitted its terminal status; joining the Promise guarantees that
+      // every caller still receives the cancellation/error outcome.
+      if (this.inFlightConnect) {
+        await this.inFlightConnect;
+      } else {
+        await this.waitForTerminal();
+      }
       if (this.getStatus() === 'ready') return;
       // Prefer the last resolveAuth error so the structured `.code` survives
       // (classifyConnectFailure needs it); fall back to the string otherwise.
@@ -441,7 +448,7 @@ export class RemoteHost {
     this.clearReconnectTimer();
     this.userDisconnected = false;
     this.reconnectAttempts = 0;
-    await this.doConnect();
+    await this.startConnectAttempt();
   }
 
   /**
@@ -1339,6 +1346,21 @@ export class RemoteHost {
     });
   }
 
+  /** Start and register a connect attempt so concurrent callers can join it. */
+  private startConnectAttempt(): Promise<void> {
+    const attempt = this.doConnect();
+    this.inFlightConnect = attempt;
+    void attempt.then(
+      () => {
+        if (this.inFlightConnect === attempt) this.inFlightConnect = null;
+      },
+      () => {
+        if (this.inFlightConnect === attempt) this.inFlightConnect = null;
+      },
+    );
+    return attempt;
+  }
+
   private handlePostReadyError(err: Error): void {
     this.lastError = err.message;
     this.log.warn('ssh post-ready error', { id: this.id, error: err.message });
@@ -1387,7 +1409,7 @@ export class RemoteHost {
     });
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      void this.doConnect().catch((err) => {
+      void this.startConnectAttempt().catch((err) => {
         // doConnect already set status=failed and recorded lastError.
         // If we still have attempts left, schedule again.
         if (this.userDisconnected) return;

@@ -149,7 +149,14 @@ describe('resolveAuth OpenSSH agent metadata', () => {
           identityFileNoneSeen: false,
         },
       });
-      expect(resolved).toMatchObject({ agent: '/tmp/cindy-test-agent.sock', label: 'ssh-agent' });
+      expect(resolved).toMatchObject({
+        // Windows OpenSSH uses its named pipe by default; POSIX uses the
+        // SSH_AUTH_SOCK environment variable.
+        agent: process.platform === 'win32'
+          ? '\\\\.\\pipe\\openssh-ssh-agent'
+          : '/tmp/cindy-test-agent.sock',
+        label: 'ssh-agent',
+      });
     } finally {
       if (previous === undefined) delete process.env.SSH_AUTH_SOCK;
       else process.env.SSH_AUTH_SOCK = previous;
@@ -176,20 +183,27 @@ describe('resolveAuth OpenSSH agent metadata', () => {
   });
 
   it('rejects an empty IdentitiesOnly allow-list', async () => {
-    await expect(resolveAuth({
-      id: 'empty-pin',
-      hostname: '192.0.2.12',
-      port: 22,
-      user: 'developer',
-      authMethod: 'agent',
-      source: 'ssh-config',
-      managedByCindy: false,
-      sshAuthentication: {
-        identitiesOnly: true,
-        configuredIdentityFiles: [],
-        identityFileDirectiveSeen: true,
-        identityFileNoneSeen: true,
-      },
-    })).rejects.toMatchObject({ code: SSH_CONFIG_AUTH_UNSUPPORTED_CODE });
+    const previous = process.env.SSH_AUTH_SOCK;
+    delete process.env.SSH_AUTH_SOCK;
+    try {
+      await expect(resolveAuth({
+        id: 'empty-pin',
+        hostname: '192.0.2.12',
+        port: 22,
+        user: 'developer',
+        authMethod: 'agent',
+        source: 'ssh-config',
+        managedByCindy: false,
+        sshAuthentication: {
+          identitiesOnly: true,
+          configuredIdentityFiles: [],
+          identityFileDirectiveSeen: true,
+          identityFileNoneSeen: true,
+        },
+      })).rejects.toMatchObject({ code: SSH_CONFIG_AUTH_UNSUPPORTED_CODE });
+    } finally {
+      if (previous === undefined) delete process.env.SSH_AUTH_SOCK;
+      else process.env.SSH_AUTH_SOCK = previous;
+    }
   });
 });

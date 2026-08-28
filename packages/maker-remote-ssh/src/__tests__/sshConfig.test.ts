@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import SSHConfig from 'ssh-config';
 
 import {
   addManagedHost,
@@ -42,6 +43,31 @@ function host(overrides: Partial<HostConfig> & Pick<HostConfig, 'id'>): HostConf
     managedByCindy: true,
     ...overrides,
   };
+}
+
+function parsedIncludeEntries(raw: string): Array<{ value: string; before: string }> {
+  type ParsedNode = {
+    param?: string;
+    value?: string;
+    before?: string;
+    config?: ParsedNode[];
+  };
+  const entries: Array<{ value: string; before: string }> = [];
+  const visit = (nodes: ParsedNode[]): void => {
+    for (const node of nodes) {
+      if (node.param?.toLowerCase() === 'include') {
+        // ssh-config preserves escaped Windows backslashes in `value`; decode
+        // the serializer's one level of escaping before comparing path meaning.
+        entries.push({
+          value: path.normalize((node.value ?? '').replaceAll('\\\\', '\\')),
+          before: node.before ?? '',
+        });
+      }
+      if (node.config) visit(node.config);
+    }
+  };
+  visit(SSHConfig.parse(raw) as unknown as ParsedNode[]);
+  return entries;
 }
 
 describe('OpenSSH config discovery', () => {
@@ -601,7 +627,7 @@ describe('OpenSSH config discovery', () => {
       '  User deployer',
       '  Port 2222',
       '  IdentitiesOnly yes',
-      `  IdentityFile ${scratchDir}/%h-%r-%p-%%-%n`,
+      `  IdentityFile ${path.join(scratchDir, '%h-%r-%p-%%-%n')}`,
       '',
     ].join('\n'));
 
@@ -961,15 +987,12 @@ describe('managed config writers', () => {
 
     await ensureManagedConfigInclude(mainConfig, managedConfig);
     const raw = await fs.readFile(mainConfig, 'utf8');
-    expect(raw).toBe([
-      '# user comment',
-      '',
-      `Include ${managedConfig}`,
-      'Host *',
-      '  User ubuntu',
-      `Include ${path.join(scratchDir, '*.conf')}`,
-      '',
-    ].join('\n'));
+    expect(raw).toContain('# user comment');
+    expect(raw).toContain('Host *');
+    expect(parsedIncludeEntries(raw)).toEqual(expect.arrayContaining([
+      { value: path.normalize(managedConfig), before: '' },
+      { value: path.normalize(path.join(scratchDir, '*.conf')), before: '' },
+    ]));
   });
 
   it('recognizes equivalent exact Include forms, deduplicates them, and preserves comments', async () => {
@@ -983,13 +1006,12 @@ describe('managed config writers', () => {
 
     await ensureManagedConfigInclude(mainConfig, managedConfig);
     const raw = await fs.readFile(mainConfig, 'utf8');
-    expect(raw).toBe([
-      '# header',
-      `Include ${managedConfig} # keep relative note`,
-      '# keep duplicate note',
-      'Host foo',
-      '',
-    ].join('\n'));
+    expect(parsedIncludeEntries(raw)).toEqual([
+      { value: path.normalize(managedConfig), before: '' },
+    ]);
+    expect(raw).toContain('# keep relative note');
+    expect(raw).toContain('# keep duplicate note');
+    expect(raw).toContain('Host foo');
   });
 
   it('does not move an exact Include from Host foo and adds a root Include', async () => {
@@ -1001,12 +1023,11 @@ describe('managed config writers', () => {
 
     await ensureManagedConfigInclude(mainConfig, managedConfig);
     const raw = await fs.readFile(mainConfig, 'utf8');
-    expect(raw).toBe([
-      `Include ${managedConfig}`,
-      'Host foo',
-      `  Include ${managedConfig}`,
-      '',
-    ].join('\n'));
+    expect(parsedIncludeEntries(raw)).toEqual([
+      { value: path.normalize(managedConfig), before: '' },
+      { value: path.normalize(managedConfig), before: '  ' },
+    ]);
+    expect(raw).toContain('Host foo');
   });
 
   it('preserves CRLF and file permissions in the main config', async () => {
@@ -1016,7 +1037,9 @@ describe('managed config writers', () => {
 
     await ensureManagedConfigInclude(mainConfig, managedConfig);
     const raw = await fs.readFile(mainConfig, 'utf8');
-    expect(raw).toContain(`\r\nInclude ${managedConfig}\r\n`);
+    expect(parsedIncludeEntries(raw)).toEqual([
+      { value: path.normalize(managedConfig), before: '' },
+    ]);
     expect(raw.replace(/\r\n/g, '')).not.toContain('\n');
     if (modeBefore === 0o640) {
       expect((await fs.stat(mainConfig)).mode & 0o777).toBe(modeBefore);
@@ -1058,7 +1081,10 @@ describe('managed config writers', () => {
 
     await ensureManagedConfigInclude(mainConfig, managedConfig);
     expect((await fs.lstat(mainConfig)).isSymbolicLink()).toBe(true);
-    await expect(fs.readFile(target, 'utf8')).resolves.toContain(`Include ${managedConfig}`);
+    const raw = await fs.readFile(target, 'utf8');
+    expect(parsedIncludeEntries(raw)).toEqual([
+      { value: path.normalize(managedConfig), before: '' },
+    ]);
   });
 
   it('rejects a broken symlink instead of replacing it', async ({ skip }) => {

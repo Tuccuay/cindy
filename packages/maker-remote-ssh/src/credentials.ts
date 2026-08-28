@@ -75,18 +75,7 @@ export async function resolveAuth(host: HostConfig): Promise<ResolvedAuth> {
   }
 
   if (host.authMethod === 'agent') {
-    let endpoint: string;
-    try {
-      endpoint = await resolveAgentEndpoint(host.sshAuthentication?.identityAgent);
-    } catch (err) {
-      if ((err as { code?: unknown } | null)?.code === SSH_AGENT_UNAVAILABLE_CODE) throw err;
-      throwUnsupported((err as Error).message);
-    }
-
     let allowedFingerprints = host.sshAuthentication?.allowedAgentFingerprints;
-    if (host.sshAuthentication?.identitiesOnly && (!allowedFingerprints || allowedFingerprints.length === 0)) {
-      throwUnsupported('IdentitiesOnly yes has no public key Cindy can use to pin the agent');
-    }
 
     // A marker-authenticated agent host may carry an explicit Cindy pin even
     // when IdentitiesOnly is no. External IdentityFile metadata never enters
@@ -103,6 +92,25 @@ export async function resolveAuth(host: HostConfig): Promise<ResolvedAuth> {
         throw e;
       }
     }
+
+    // Validate deterministic configuration limits before touching the local
+    // Agent endpoint. This keeps a missing SSH_AUTH_SOCK from masking the
+    // more actionable IdentitiesOnly capability error (and makes the result
+    // independent of whether an Agent happens to be running in the process
+    // environment).
+    if (host.sshAuthentication?.identitiesOnly
+      && (!allowedFingerprints || allowedFingerprints.length === 0)) {
+      throwUnsupported('IdentitiesOnly yes has no public key Cindy can use to pin the agent');
+    }
+
+    let endpoint: string;
+    try {
+      endpoint = await resolveAgentEndpoint(host.sshAuthentication?.identityAgent);
+    } catch (err) {
+      if ((err as { code?: unknown } | null)?.code === SSH_AGENT_UNAVAILABLE_CODE) throw err;
+      throwUnsupported((err as Error).message);
+    }
+
     if (allowedFingerprints && allowedFingerprints.length > 0) {
       try {
         const filtered = createFilteredAgentFromFingerprints(allowedFingerprints, endpoint);
