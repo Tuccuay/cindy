@@ -31,6 +31,7 @@ import {
 	discoverTestFiles,
 	expandWorkspacePatterns,
 	filterRunsByWorkspace,
+	isIgnoredFile,
 	mapWithConcurrency,
 	normalizeRelPath,
 	parseWorkspacePatterns,
@@ -52,6 +53,7 @@ import {
 	resolvePnpmInvocation,
 	usablePnpmExecPath,
 } from "../shared/pnpm-invocation.mjs";
+import { findSymlinkPlatformSkips } from "../shared/symlink-test-guard.mjs";
 
 const ROOT = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
 
@@ -291,6 +293,41 @@ test("discoverTestFiles ignores generated and nested non-workspace directories",
 	]);
 });
 
+test("isIgnoredFile ignores the git-ignored tmp/ product directory", () => {
+	// .gitignore 忽略 tmp/（会话工具临时产物）。readAllFiles 若递归进去，
+	// 遇到沙箱/工具遗留的不可读子目录会 EPERM 让整个门禁失败（#3353）。
+	assert.equal(isIgnoredFile("tmp/blocked"), true);
+	assert.equal(isIgnoredFile("tmp/nested/deep/file.ts"), true);
+	assert.equal(isIgnoredFile("packages/orca-workflow/tmp/x.test.ts"), true);
+	// 含 "tmp" 的合法包名/文件名不应被误杀（按路径段精确匹配）。
+	assert.equal(isIgnoredFile("packages/tmp-adapter/src/index.ts"), false);
+});
+
+test("readAllFiles tolerates an unreadable directory instead of crashing the gate", () => {
+	// 平台不支持把目录 chmod 成不可读时（Windows）跳过：EPERM 容错分支在
+	// POSIX 上由 chmod 0o000 覆盖，逻辑本身是平台无关的 try/catch。
+	if (process.platform === "win32") return;
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "read-all-files-"));
+	try {
+		fs.mkdirSync(path.join(root, "src"), { recursive: true });
+		fs.writeFileSync(path.join(root, "src", "a.test.ts"), "// ok\n");
+		// 一个当前进程无权 scandir 的目录（模拟沙箱遗留物）。
+		const locked = path.join(root, "tmp", "locked");
+		fs.mkdirSync(locked, { recursive: true });
+		fs.writeFileSync(path.join(locked, "secret.txt"), "x");
+		fs.chmodSync(path.join(root, "tmp", "locked"), 0o000);
+		try {
+			const files = readAllFiles(root);
+			assert.deepEqual(files.map(normalizeRelPath).sort(), ["src/a.test.ts"]);
+		} finally {
+			// 必须先恢复权限才能在 Windows/POSIX 清理临时目录。
+			fs.chmodSync(path.join(root, "tmp", "locked"), 0o700);
+		}
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("checkTestFiles fails runnable tiers with no selected tests", () => {
 	const workspace = { cwd: "packages/orca-workflow", status: "required" };
 	const tier = { status: "required", include: ["src/__tests__/**/*.test.ts"] };
@@ -490,6 +527,65 @@ test("tests never bind a fixed numeric port", () => {
 			for (const match of source.matchAll(pattern)) {
 				if (Number(match[1]) !== 0) violations.push(`${file}:${match[1]}`);
 			}
+		}
+	}
+	assert.deepEqual(violations, []);
+});
+
+test("symlink platform-skip guard detects hard skips without flagging capability probes", () => {
+	assert.deepEqual(
+		findSymlinkPlatformSkips(`
+			it.skipIf(process.platform === "win32")("rejects escape", async () => {
+				await fs.symlink(outside, link);
+			});
+		`),
+		[{ line: 2 }],
+	);
+	assert.deepEqual(
+		findSymlinkPlatformSkips(`
+			it.skipIf(!canCreateSymlink)("rejects escape", async () => {
+				await fs.symlink(outside, link);
+			});
+			it.skipIf(process.platform === "win32")("sends SIGTERM", async () => {
+				await stopProcess();
+			});
+		`),
+		[],
+	);
+	assert.deepEqual(
+		findSymlinkPlatformSkips(`
+			it("rejects escape", async () => {
+				if (process.platform === "win32") return;
+				await fs.symlink(outside, link);
+			});
+		`),
+		[{ line: 3 }],
+	);
+});
+
+test("symlink platform-skip guard requires a concrete POSIX-only exception", () => {
+	const skippedTest = `
+		// symlink-platform-skip: Windows cannot represent non-UTF-8 link target bytes.
+		it.skipIf(process.platform === "win32")("hashes raw link bytes", async () => {
+			await fs.symlink(Buffer.from([0xff]), link);
+		});
+	`;
+	assert.deepEqual(findSymlinkPlatformSkips(skippedTest), []);
+	assert.deepEqual(
+		findSymlinkPlatformSkips(skippedTest.replace(
+			"Windows cannot represent non-UTF-8 link target bytes.",
+			"POSIX only",
+		)),
+		[{ line: 3 }],
+	);
+});
+
+test("symlink tests never skip solely because the host is Windows", () => {
+	const violations = [];
+	for (const file of discoverTestFiles(readAllFiles(ROOT))) {
+		const source = fs.readFileSync(path.join(ROOT, file), "utf8");
+		for (const violation of findSymlinkPlatformSkips(source)) {
+			violations.push(`${file}:${violation.line}`);
 		}
 	}
 	assert.deepEqual(violations, []);

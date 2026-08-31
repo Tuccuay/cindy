@@ -438,6 +438,85 @@ describe('remoteSessionStore', () => {
     expect(remoteSessionStore.getSessions()[0].agentSwitchIntent).toBeNull();
   });
 
+  it('applies runtime model projections and preserves them only for legacy snapshots', () => {
+    const runtimeBaseline = {
+      agentKind: 'codex' as const,
+      model: 'gpt-baseline',
+      providerId: 'xd',
+      effort: 'high',
+      fastMode: false,
+    };
+    const runtimeEffective = {
+      agentKind: 'codex' as const,
+      model: 'gpt-runtime',
+      providerId: 'openai',
+      effort: 'xhigh',
+      fastMode: true,
+    };
+    remoteSessionStore.setDeviceSessions('dev-1', 'Mac', [session('s1')]);
+    remoteSessionStore.applySessionPatch('dev-1', 's1', {
+      model: runtimeEffective.model,
+      providerId: runtimeEffective.providerId,
+      effort: runtimeEffective.effort,
+      fastMode: runtimeEffective.fastMode,
+      runtimeGeneration: 3,
+      runtimeBaseline,
+      runtimeEffective,
+      runtimePending: null,
+    });
+
+    remoteSessionStore.setDeviceSessions('dev-1', 'Mac', [
+      session('s1', { title: 'Legacy snapshot' }),
+    ]);
+    expect(remoteSessionStore.getSessions()[0]).toMatchObject({
+      title: 'Legacy snapshot',
+      runtimeGeneration: 3,
+      runtimeBaseline,
+      runtimeEffective,
+      runtimePending: null,
+    });
+
+    const settledBaseline = { ...runtimeBaseline, model: 'gpt-user-selected' };
+    remoteSessionStore.setDeviceSessions('dev-1', 'Mac', [
+      session('s1', {
+        model: settledBaseline.model,
+        runtimeGeneration: 0,
+        runtimeBaseline: settledBaseline,
+        runtimeEffective: settledBaseline,
+        runtimePending: null,
+      }),
+    ]);
+    expect(remoteSessionStore.getSessions()[0]).toMatchObject({
+      model: 'gpt-user-selected',
+      runtimeGeneration: 0,
+      runtimeBaseline: settledBaseline,
+      runtimeEffective: settledBaseline,
+      runtimePending: null,
+    });
+  });
+
+  it('clears stale effort for a fixed-strength runtime model', () => {
+    remoteSessionStore.setDeviceSessions('dev-1', 'Mac', [session('s1', { effort: 'high' })]);
+    remoteSessionStore.applySessionPatch('dev-1', 's1', {
+      model: 'fixed-strength-model',
+      providerId: 'openai',
+      effort: '',
+      runtimeEffective: {
+        agentKind: 'codex',
+        model: 'fixed-strength-model',
+        providerId: 'openai',
+        effort: null,
+        fastMode: false,
+      },
+    });
+
+    expect(remoteSessionStore.getSessions()[0]).toMatchObject({
+      model: 'fixed-strength-model',
+      effort: '',
+      runtimeEffective: { effort: null },
+    });
+  });
+
   it('does not let a draft sentinel snapshot replace an optimistic first-message title', () => {
     remoteSessionStore.setDeviceSessions('dev-1', 'Mac', [
       session('s1', { title: '帮我排查登录失败' }),
@@ -593,6 +672,32 @@ describe('remoteSessionStore', () => {
       expect(notify).toHaveBeenCalledTimes(1);
     } finally {
       unsubscribe();
+      vi.useRealTimers();
+    }
+  });
+
+  it('finalizes the previous streaming assistant when the persist id changes', () => {
+    vi.useFakeTimers();
+    try {
+      pushMakerText('s1', 'commentary-row', 'Inspecting the workspace', false);
+      vi.runOnlyPendingTimers();
+
+      pushMakerText('s1', 'final-answer-row', 'The fix is ready', false);
+      vi.runOnlyPendingTimers();
+
+      expect(remoteSessionStore.getMessages('s1')).toMatchObject([
+        {
+          clientId: 'commentary-row',
+          content: 'Inspecting the workspace',
+          agentMeta: null,
+        },
+        {
+          clientId: 'final-answer-row',
+          content: 'The fix is ready',
+          agentMeta: { isStreaming: true },
+        },
+      ]);
+    } finally {
       vi.useRealTimers();
     }
   });
@@ -2712,6 +2817,52 @@ describe('remoteSessionStore', () => {
     });
 
     expect(remoteSessionStore.getSessions()[0].title).toBe('New');
+  });
+
+  it('fences an older whole-list snapshot after created/patched pushes per device', () => {
+    remoteSessionStore.setDeviceSessions('dev-1', 'Mac', [session('s1', { title: 'Old' })]);
+    const dev1Epoch = remoteSessionStore.captureDeviceSessionListMutationEpoch('dev-1');
+    const dev2Epoch = remoteSessionStore.captureDeviceSessionListMutationEpoch('dev-2');
+
+    remoteSessionStore.applyRemotePush('dev-1', 'local-db:sessions:patched', {
+      sessionId: 's1',
+      patch: { title: 'New' },
+    });
+    expect(remoteSessionStore.isDeviceSessionListMutationEpochCurrent('dev-1', dev1Epoch)).toBe(false);
+    expect(remoteSessionStore.isDeviceSessionListMutationEpochCurrent('dev-2', dev2Epoch)).toBe(true);
+
+    const afterPatch = remoteSessionStore.captureDeviceSessionListMutationEpoch('dev-1');
+    remoteSessionStore.applyRemotePush('dev-1', 'local-db:sessions:created', { sessionId: 's2' });
+    expect(remoteSessionStore.isDeviceSessionListMutationEpochCurrent('dev-1', afterPatch)).toBe(false);
+
+    const beforeReset = remoteSessionStore.captureDeviceSessionListMutationEpoch('dev-1');
+    remoteSessionStore.clear();
+    expect(remoteSessionStore.isDeviceSessionListMutationEpochCurrent('dev-1', beforeReset)).toBe(false);
+  });
+
+  it('fences an older whole-list snapshot after valid session usage pushes', () => {
+    remoteSessionStore.setDeviceSessions('dev-1', 'Mac', [session('s1')]);
+
+    const beforeSpend = remoteSessionStore.captureDeviceSessionListMutationEpoch('dev-1');
+    remoteSessionStore.applyRemotePush('dev-1', 'usage:session-spend-changed', {
+      sessionId: 's1',
+      totalCostUsd: 1.23,
+    });
+    expect(remoteSessionStore.isDeviceSessionListMutationEpochCurrent('dev-1', beforeSpend)).toBe(false);
+
+    const beforeTokens = remoteSessionStore.captureDeviceSessionListMutationEpoch('dev-1');
+    remoteSessionStore.applyRemotePush('dev-1', 'usage:session-tokens-changed', {
+      sessionId: 's1',
+      totalTokens: 45_000,
+    });
+    expect(remoteSessionStore.isDeviceSessionListMutationEpochCurrent('dev-1', beforeTokens)).toBe(false);
+
+    const beforeInvalid = remoteSessionStore.captureDeviceSessionListMutationEpoch('dev-1');
+    remoteSessionStore.applyRemotePush('dev-1', 'usage:session-tokens-changed', {
+      sessionId: 's1',
+      totalTokens: -1,
+    });
+    expect(remoteSessionStore.isDeviceSessionListMutationEpochCurrent('dev-1', beforeInvalid)).toBe(true);
   });
 
   it('mirrors goal status pushes per session and clears on null goal', () => {

@@ -12,6 +12,8 @@ export function printHelp(log = console.log) {
   log('    pnpm restart:desktop:remote --region=cn');
   log('    # Cindy，读取 Global 线上 CDN 端点清单');
   log('    pnpm restart:desktop:remote --endpoints-cdn');
+  log('    # 共享正式版登录态/数据（旧行为；默认已是固定的 dev 独立沙箱）');
+  log('    pnpm restart:desktop:remote -- --shared');
   log('    # Human 可直接启动；不会先清旧进程，Agent 不要使用');
   log('    pnpm dev:desktop:remote');
   log('    pnpm dev:desktop:remote --region=cn');
@@ -51,6 +53,9 @@ export function printHelp(log = console.log) {
   log('    pnpm mobile:sim:start');
   log('    # 中国大陆版模拟器：先 rebuild 安装，再 start 启动 Metro');
   log('    pnpm mobile:sim:rebuild -- --region=cn');
+  log('    # Windows 一键复用/启动 cindy-api36、配置 adb reverse，并启动中国大陆版 Metro');
+  log('    pnpm mobile:sim:start:cn');
+  log('    # 等价的显式区域写法；--no-emulator 可只启动 Metro');
   log('    pnpm mobile:sim:start -- --region=cn');
   log('    # 查看当前 Metro 对应的 checkout / branch');
   log('    pnpm mobile:sim:whoami');

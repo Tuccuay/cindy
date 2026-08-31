@@ -167,6 +167,21 @@ const EMPTY_SESSION_RUN_STATUS: RemoteSessionRunStatus = Object.freeze({
 });
 
 const shards = new Map<string, DeviceShard>();
+// Per-device list mutation fence. A sessions:list request may start before a live
+// sessions:created/patched push and settle after it; that older whole-list snapshot must
+// never overwrite the newer push. Epochs stay monotonic across account/store resets.
+const deviceSessionListMutationEpochs = new Map<string, number>();
+let deviceSessionListMutationEpochFloor = 0;
+let nextDeviceSessionListMutationEpoch = 0;
+
+function bumpDeviceSessionListMutationEpoch(deviceId: string): void {
+  if (!deviceId) return;
+  deviceSessionListMutationEpochs.set(deviceId, ++nextDeviceSessionListMutationEpoch);
+}
+
+function readDeviceSessionListMutationEpoch(deviceId: string): number {
+  return deviceSessionListMutationEpochs.get(deviceId) ?? deviceSessionListMutationEpochFloor;
+}
 // 工作端拥有的 New Maker worktree 偏好按设备隔离；这里只是不持久化的显示镜像，
 // push 属 sessions topic，无 sessionId。唯一持久副本仍在被控端现有 Cindy 配置里。
 const newMakerWorktreePreferences = new Map<string, RemoteNewMakerWorktreePreference>();
@@ -1231,18 +1246,26 @@ function applyPendingTitlePreview(session: RemoteSession): RemoteSession {
 }
 
 /**
- * SQLite session 快照不包含 desktop main 内存里的 pending Agent intent。全量列表 / getSession
- * 对账只能刷新持久化字段，不能顺手抹掉已由 push / 权威查询写入的运行时镜像；显式携带该字段
- * 的新快照仍优先（包括 null）。
+ * 老 Desktop 的 SQLite session 快照不包含 main 内存里的 pending Agent intent / runtime
+ * projection。全量列表 / getSession 对账只能刷新它实际携带的字段，不能顺手抹掉已由 push /
+ * 权威查询写入的运行时镜像；新 Desktop 显式携带这些字段时仍优先（包括 null）。
  */
-function preserveSessionRuntimeFields(fresh: RemoteSession, local: RemoteSession | undefined): RemoteSession {
+function preserveSessionRuntimeFields(
+  fresh: RemoteSession,
+  local: RemoteSession | undefined,
+): RemoteSession {
   if (!local) return fresh;
   let next = fresh;
-  if (
-    !Object.prototype.hasOwnProperty.call(fresh, 'agentSwitchIntent')
-    && local.agentSwitchIntent !== undefined
-  ) {
-    next = { ...next, agentSwitchIntent: local.agentSwitchIntent };
+  for (const key of [
+    'agentSwitchIntent',
+    'runtimeGeneration',
+    'runtimeBaseline',
+    'runtimeEffective',
+    'runtimePending',
+  ] as const) {
+    if (!Object.prototype.hasOwnProperty.call(fresh, key) && local[key] !== undefined) {
+      next = { ...next, [key]: local[key] };
+    }
   }
   return next;
 }
@@ -2106,6 +2129,14 @@ function applyRemoteTextEvent(
     && hasAuthoritativePendingAssembly;
   if (rejectsBeforeClientIdMutation) return false;
 
+  const previousStreamingClientId = streamingAssistantClientIds.get(sessionId);
+  const normalizedPersistId = persistId?.trim();
+  const itemBoundaryClientId = normalizedPersistId
+    && previousStreamingClientId
+    && !isGeneratedStreamingClientId(previousStreamingClientId)
+    && previousStreamingClientId !== normalizedPersistId
+    ? previousStreamingClientId
+    : undefined;
   const clientIdResolution = streamingClientIdFor(sessionId, persistId);
   const { clientId } = clientIdResolution;
   const previousStreamingDeviceId = streamingAssistantDeviceId(sessionId, clientId);
@@ -2140,6 +2171,9 @@ function applyRemoteTextEvent(
       )
     );
   if (rejectsNonAuthoritativeTransportReplay) return clientIdResolution.changed;
+  const itemBoundaryChanged = itemBoundaryClientId
+    ? finalizeRemoteStreamingMessageByClientId(sessionId, itemBoundaryClientId)
+    : false;
   const resetsTransportAssembly = previousStreamingDeviceId !== undefined
     && deviceId !== undefined
     && previousStreamingDeviceId !== deviceId
@@ -2203,7 +2237,7 @@ function applyRemoteTextEvent(
     ) {
       rememberStreamingAssistantDeviceId(sessionId, clientId, deviceId);
     }
-    return changed || clientIdResolution.changed;
+    return changed || clientIdResolution.changed || itemBoundaryChanged;
   }
 
   const currentText = existing ? contentToPreview(existing.content) : '';
@@ -2281,7 +2315,7 @@ function applyRemoteTextEvent(
   ) {
     rememberStreamingAssistantDeviceId(sessionId, clientId, deviceId);
   }
-  return changed || clientIdResolution.changed;
+  return changed || clientIdResolution.changed || itemBoundaryChanged;
 }
 
 function isRemoteTextDeltaEvent(event: Record<string, unknown>): boolean {
@@ -2392,6 +2426,28 @@ function clearTextDeltaFlushTimer(): void {
 function discardPendingTextDelta(sessionId: string): void {
   pendingTextDeltaBatches.delete(sessionId);
   if (pendingTextDeltaBatches.size === 0) clearTextDeltaFlushTimer();
+}
+
+function finalizeRemoteStreamingMessageByClientId(
+  sessionId: string,
+  clientId: string,
+): boolean {
+  const existing = messages.get(sessionId);
+  if (!existing) return false;
+  let changed = false;
+  const next = existing.map((message) => {
+    if (
+      message.role !== 'assistant'
+      || message.agentMeta?.isStreaming !== true
+      || (message.id !== clientId && message.clientId !== clientId)
+    ) return message;
+    changed = true;
+    return { ...message, agentMeta: clearStreamingMeta(message.agentMeta) };
+  });
+  if (!changed) return false;
+  messages.set(sessionId, next);
+  bumpMessageVersion();
+  return true;
 }
 
 function finalizeRemoteStreamingMessages(
@@ -3483,6 +3539,14 @@ export const remoteSessionStore = {
     return makerActivityEpoch;
   },
 
+  captureDeviceSessionListMutationEpoch(deviceId: string): number {
+    return readDeviceSessionListMutationEpoch(deviceId);
+  },
+
+  isDeviceSessionListMutationEpochCurrent(deviceId: string, epoch: number): boolean {
+    return readDeviceSessionListMutationEpoch(deviceId) === epoch;
+  },
+
   setActiveSessionSnapshots(
     deviceId: string,
     list: readonly unknown[],
@@ -3647,6 +3711,7 @@ export const remoteSessionStore = {
       return;
     }
     if (channel === 'local-db:sessions:created') {
+      bumpDeviceSessionListMutationEpoch(deviceId);
       reseedHandlers.get(deviceId)?.forEach((handler) => handler());
       return;
     }
@@ -3660,6 +3725,7 @@ export const remoteSessionStore = {
       const sessionId = readString(payload, 'sessionId');
       const patch = isRecord(payload.patch) ? payload.patch : null;
       if (sessionId && patch) {
+        bumpDeviceSessionListMutationEpoch(deviceId);
         // 遮蔽本机在途写的字段:旧写的无差别 push 回流不得滚回更新的乐观意图,
         // 被遮字段的终态由对应写的对账 / 后续 push 收敛;全部被遮时跳过应用。
         // localRow 供差异留痕判定:本笔 echo push(同值)不留痕,避免每次成功写
@@ -3807,11 +3873,13 @@ export const remoteSessionStore = {
       const totalMoney = normalizeRemoteMoney(payload.totalMoney);
       const totalCostUsd = readNumber(payload, 'totalCostUsd');
       if (sessionId && totalMoney) {
+        bumpDeviceSessionListMutationEpoch(deviceId);
         this.applySessionPatch(deviceId, sessionId, {
           totalMoney,
           ...(totalMoney.currency === 'USD' ? { totalCostUsd: totalMoney.amount } : {}),
         });
       } else if (sessionId && totalCostUsd !== null && totalCostUsd >= 0) {
+        bumpDeviceSessionListMutationEpoch(deviceId);
         this.applySessionPatch(deviceId, sessionId, { totalCostUsd });
       }
       return;
@@ -3821,6 +3889,7 @@ export const remoteSessionStore = {
       const sessionId = readString(payload, 'sessionId');
       const totalTokens = readNumber(payload, 'totalTokens');
       if (sessionId && totalTokens !== null && totalTokens >= 0) {
+        bumpDeviceSessionListMutationEpoch(deviceId);
         this.applySessionPatch(deviceId, sessionId, { totalTokenUsage: totalTokens });
       }
       return;
@@ -4309,6 +4378,7 @@ export const remoteSessionStore = {
   },
 
   removeDevice(deviceId: string): void {
+    bumpDeviceSessionListMutationEpoch(deviceId);
     const hadShard = shards.delete(deviceId);
     const hadWorktreePreference = newMakerWorktreePreferences.delete(deviceId);
     const hadWorktreeBranchPreferences = newMakerWorktreeBranchPreferences.delete(deviceId);
@@ -4385,6 +4455,8 @@ export const remoteSessionStore = {
   },
 
   clear(): void {
+    deviceSessionListMutationEpochFloor = ++nextDeviceSessionListMutationEpoch;
+    deviceSessionListMutationEpochs.clear();
     shards.clear();
     newMakerWorktreePreferences.clear();
     newMakerWorktreeBranchPreferences.clear();
