@@ -98,6 +98,23 @@ function makeDeps(
   const ensureReadyCalls: string[] = [];
   const deps: SshMcpDeps = {
     getPool: async () => pool,
+    redactSensitiveText: (snapshot, text) => {
+      const candidates = new Map<string, '<identity-agent>' | '<identity-file>'>();
+      for (const value of [
+        snapshot.config.identityFile,
+        ...(snapshot.config.sshAuthentication?.configuredIdentityFiles ?? []),
+      ]) {
+        if (value) candidates.set(value, '<identity-file>');
+      }
+      const identityAgent = snapshot.config.sshAuthentication?.identityAgent;
+      if (identityAgent) candidates.set(identityAgent, '<identity-agent>');
+      return Array.from(candidates, ([value, replacement]) => ({ value, replacement }))
+        .sort((left, right) => right.value.length - left.value.length)
+        .reduce(
+          (redacted, { value, replacement }) => redacted.split(value).join(replacement),
+          text,
+        );
+    },
     ensureReady: async (id) => {
       ensureReadyCalls.push(id);
     },
@@ -433,6 +450,55 @@ describe('ssh_exec', () => {
       .toContain('IdentityFile <identity-file> has no public key');
     expect(rawText).not.toContain('alice');
     expect(rawText).not.toContain('client-prod');
+  });
+
+  it('redacts configured and resolved Agent endpoints from status and error payloads', async () => {
+    const literal = 'SSH_AUTH_SOCK';
+    const endpoint = '/private/tmp/com.apple.launchd.example/Listeners';
+    const host = snapshot({ id: 'web-1', identityAgent: literal });
+    host.lastError = `connect ${endpoint} failed via ${literal}`;
+    const { pool } = makeFakePool([host]);
+    const { deps } = makeDeps(pool, {
+      redactSensitiveText: (_snapshot, text) => text
+        .split(endpoint).join('<identity-agent>')
+        .split(literal).join('<identity-agent>'),
+      ensureReady: async () => {
+        throw new Error(`[SSH_AGENT_UNAVAILABLE] connect ${endpoint} failed via ${literal}`);
+      },
+    });
+    const registry = makeRegistry(deps);
+
+    const status = await callParsed(registry, 'ssh_host_status', { host: 'web-1' });
+    const execution = await callParsed(registry, 'ssh_exec', {
+      host: 'web-1',
+      command: 'true',
+    });
+    for (const rawText of [status.rawText, execution.rawText]) {
+      expect(rawText).not.toContain(endpoint);
+      expect(rawText).not.toContain(literal);
+      expect(rawText).toContain('<identity-agent>');
+    }
+  });
+
+  it('fails closed when the host redaction callback throws', async () => {
+    const endpoint = '/private/tmp/private-agent.sock';
+    const host = snapshot({ id: 'web-1' });
+    host.lastError = `connect ${endpoint} failed`;
+    const { pool } = makeFakePool([host]);
+    const logger = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn(), trace: vi.fn() };
+    const { deps } = makeDeps(pool, {
+      logger,
+      redactSensitiveText: () => {
+        throw new Error(`redaction failed for ${endpoint}`);
+      },
+    });
+
+    const { rawText } = await callParsed(makeRegistry(deps), 'ssh_host_status', {
+      host: 'web-1',
+    });
+    expect(rawText).toContain('SSH error details are unavailable.');
+    expect(rawText).not.toContain(endpoint);
+    expect(JSON.stringify(logger.error.mock.calls)).not.toContain(endpoint);
   });
 
   it('unprefixed unknown error falls back to SSH_CONNECT_FAILED', async () => {

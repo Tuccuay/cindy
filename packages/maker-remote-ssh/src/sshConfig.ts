@@ -31,6 +31,8 @@ const AUTH_MARKER_PREFIX = '# xdt-maker:auth=';
 /** File-level marker proving that Cindy created/owns the managed config. */
 export const MANAGED_CONFIG_MARKER = '# xdt-maker:managed=v1';
 export const MANAGED_CONFIG_OWNERSHIP_REQUIRED_CODE = 'SSH_CONFIG_OWNERSHIP_REQUIRED';
+export const MANAGED_CONFIG_CONCURRENT_MODIFICATION_CODE = 'SSH_CONFIG_CONCURRENT_MODIFICATION';
+export const MANAGED_CONFIG_WRITE_TOKEN_REQUIRED_CODE = 'SSH_CONFIG_WRITE_TOKEN_REQUIRED';
 const MATCH_NO_ARGUMENT_CRITERIA = new Set(['all', 'canonical', 'final']);
 const MATCH_ONE_ARGUMENT_CRITERIA = new Set([
   'command',
@@ -65,7 +67,20 @@ export interface ReadSshConfigResult {
   hosts: HostConfig[];
   diagnostic: SshConfigDiagnostic | null;
   warnings: string[];
+  /**
+   * Opaque SHA-256 token for the exact Cindy-owned managed config bytes read
+   * during this discovery pass. Trusted hosts may pass it to managed writers;
+   * it must never be projected over IPC or stored on a host snapshot.
+   * Undefined when no managed path was requested, the file was not reached,
+   * or its Cindy ownership marker was absent.
+   */
+  managedConfigWriteToken?: ManagedConfigWriteToken;
 }
+
+declare const managedConfigWriteTokenBrand: unique symbol;
+export type ManagedConfigWriteToken = string & {
+  readonly [managedConfigWriteTokenBrand]: true;
+};
 
 /**
  * Conditional rollback for a host that was successfully published to the
@@ -117,7 +132,9 @@ interface WalkState {
   declarations: HostDeclaration[];
   matches: MatchDeclaration[];
   skippedConditionalIncludes: SkippedConditionalInclude[];
+  incompleteUnconditionalInclude: boolean;
   managedConfigOwned: boolean;
+  managedConfigWriteToken?: ManagedConfigWriteToken;
   directives: DirectiveRecord[];
   warnings: string[];
   order: number;
@@ -258,6 +275,7 @@ export async function readSshConfigDetailed(
     declarations: [],
     matches: [],
     skippedConditionalIncludes: [],
+    incompleteUnconditionalInclude: false,
     managedConfigOwned: false,
     directives: [],
     warnings: [],
@@ -294,6 +312,9 @@ export async function readSshConfigDetailed(
     hosts: await buildHosts(state, managedComparable),
     diagnostic: null,
     warnings: state.warnings,
+    ...(state.managedConfigWriteToken
+      ? { managedConfigWriteToken: state.managedConfigWriteToken }
+      : {}),
   };
 }
 
@@ -317,9 +338,9 @@ async function walkFile(
   }
   if (state.visited.has(physicalPath)) return;
 
-  let raw: string;
+  let rawBytes: Buffer;
   try {
-    raw = await fs.readFile(physicalPath, 'utf8');
+    rawBytes = await fs.readFile(physicalPath);
   } catch (error) {
     if (optional && (error as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw error;
@@ -327,11 +348,12 @@ async function walkFile(
   if (state.files.length >= MAX_INCLUDE_FILES) {
     throw limitError(physicalPath, `Include file count exceeds ${MAX_INCLUDE_FILES}`);
   }
-  const bytes = Buffer.byteLength(raw, 'utf8');
+  const bytes = rawBytes.byteLength;
   if (state.bytes + bytes > MAX_INCLUDE_BYTES) {
     throw limitError(physicalPath, `expanded SSH config exceeds ${MAX_INCLUDE_BYTES} bytes`);
   }
 
+  const raw = rawBytes.toString('utf8');
   try {
     SSHConfig.parse(raw);
   } catch (error) {
@@ -348,6 +370,9 @@ async function walkFile(
   state.bytes += bytes;
   if (state.managedComparable !== null && pathsEqual(physicalPath, state.managedComparable)) {
     state.managedConfigOwned = hasManagedConfigMarker(raw);
+    state.managedConfigWriteToken = state.managedConfigOwned
+      ? managedConfigToken(rawBytes)
+      : undefined;
   }
 
   let scope = inheritedScope;
@@ -409,6 +434,7 @@ async function walkFile(
         const expansion = expandIncludePath(patternValue);
         if ('warning' in expansion) {
           state.warnings.push(`${location}: ${expansion.warning}`);
+          state.incompleteUnconditionalInclude = true;
           continue;
         }
         const expanded = expansion.pattern;
@@ -436,6 +462,14 @@ async function walkFile(
 
     if (isCanonicalizationDirective(directive.keyword)) {
       state.warnings.push(`${location}: hostname canonicalization is not evaluated by Cindy.`);
+      if (directive.keyword === 'canonicalizehostname' && scope.kind !== 'match') {
+        state.directives.push({
+          name: directive.keyword,
+          value: firstWordOrRaw(directive.value),
+          scope,
+          order: state.order++,
+        });
+      }
       continue;
     }
     if (scope.kind === 'match') continue;
@@ -515,14 +549,16 @@ async function buildHosts(
     const hostnameExpansion = hostnameRaw === undefined
       ? { hostname: alias }
       : expandHostNameTokens(hostnameRaw, alias);
+    const unsupportedHostNameToken = hostnameExpansion.unsupportedToken;
     if (hostnameExpansion.unsupportedToken !== undefined) {
       state.warnings.push(
-        `SSH host ${JSON.stringify(alias)} was skipped because HostName uses unsupported token `
+        `SSH host ${JSON.stringify(alias)} remains listed but unsupported because HostName uses token `
         + `${JSON.stringify(hostnameExpansion.unsupportedToken)}.`,
       );
-      continue;
     }
-    const hostname = hostnameExpansion.hostname;
+    // The alias is display-only on this path. unsupportedReason below prevents
+    // it from reaching TCP, TOFU, or endpoint fingerprinting.
+    const hostname = hostnameExpansion.hostname ?? alias;
     const user = firstMatchingDirective(state.directives, alias, 'user')
       ?? os.userInfo().username;
     const port = parseIntSafe(firstMatchingDirective(state.directives, alias, 'port'), DEFAULT_PORT);
@@ -559,10 +595,9 @@ async function buildHosts(
     }
     if (unsupportedIdentityToken !== undefined) {
       state.warnings.push(
-        `SSH host ${JSON.stringify(alias)} was skipped because IdentityFile uses unsupported token `
+        `SSH host ${JSON.stringify(alias)} remains listed but unsupported because IdentityFile uses token `
         + `${JSON.stringify(unsupportedIdentityToken)}.`,
       );
-      continue;
     }
     const introducingIdentityIndex = identityRaw === undefined
       ? -1
@@ -581,15 +616,30 @@ async function buildHosts(
       : identitiesOnly
         ? defaultIdentityPaths()
         : [];
-    let unsupportedReason = matchMayAffectHost
-      ? 'Cindy does not evaluate a Match block that may affect this SSH host'
-      : conditionalIncludeMayAffectHost
-        ? 'Cindy does not expand a conditional Include that may affect this SSH host'
-        : identitiesOnlyRaw !== undefined
-          && identitiesOnlyRaw.toLowerCase() !== 'yes'
-          && identitiesOnlyRaw.toLowerCase() !== 'no'
-          ? `unsupported IdentitiesOnly value: ${identitiesOnlyRaw}`
-          : undefined;
+    const canonicalizeHostname = firstMatchingDirective(
+      state.directives,
+      alias,
+      'canonicalizehostname',
+    )?.toLowerCase();
+    let unsupportedReason = state.incompleteUnconditionalInclude
+      ? 'Cindy could not completely expand an unconditional Include'
+      : matchMayAffectHost
+        ? 'Cindy does not evaluate a Match block that may affect this SSH host'
+        : conditionalIncludeMayAffectHost
+          ? 'Cindy does not expand a conditional Include that may affect this SSH host'
+          : canonicalizeHostname !== undefined && canonicalizeHostname !== 'no'
+            ? canonicalizeHostname === 'yes' || canonicalizeHostname === 'always'
+              ? 'Cindy does not implement OpenSSH hostname canonicalization'
+              : `unsupported CanonicalizeHostname value: ${canonicalizeHostname}`
+            : unsupportedHostNameToken !== undefined
+              ? `unsupported HostName token: ${unsupportedHostNameToken}`
+              : unsupportedIdentityToken !== undefined
+                ? `unsupported IdentityFile token: ${unsupportedIdentityToken}`
+                : identitiesOnlyRaw !== undefined
+                  && identitiesOnlyRaw.toLowerCase() !== 'yes'
+                  && identitiesOnlyRaw.toLowerCase() !== 'no'
+                  ? `unsupported IdentitiesOnly value: ${identitiesOnlyRaw}`
+                  : undefined;
     const unsupportedTransportDirectives = ['proxyjump', 'proxycommand']
       .filter((name) => {
         const value = firstMatchingDirective(state.directives, alias, name);
@@ -1089,8 +1139,12 @@ export async function addManagedHostWithInclude(
 export async function updateManagedHostFields(
   host: HostConfig,
   managedConfigPath: string,
+  expectedToken: ManagedConfigWriteToken,
 ): Promise<void> {
-  const existing = await readRawConfig(managedConfigPath);
+  assertManagedWriteToken(expectedToken);
+  const existingBytes = await readRawConfigBytes(managedConfigPath);
+  assertManagedConfigUnchanged(existingBytes, expectedToken);
+  const existing = existingBytes.toString('utf8');
   assertManagedConfigOwnership(existing);
   if (!existing) throw new Error(`managed SSH host not found: ${host.id}`);
   const parsed = SSHConfig.parse(existing) as SshConfigSection[];
@@ -1104,8 +1158,15 @@ export async function updateManagedHostFields(
   );
 }
 
-export async function removeManagedHost(alias: string, managedConfigPath: string): Promise<void> {
-  const existing = await readRawConfig(managedConfigPath);
+export async function removeManagedHost(
+  alias: string,
+  managedConfigPath: string,
+  expectedToken: ManagedConfigWriteToken,
+): Promise<void> {
+  assertManagedWriteToken(expectedToken);
+  const existingBytes = await readRawConfigBytes(managedConfigPath);
+  assertManagedConfigUnchanged(existingBytes, expectedToken);
+  const existing = existingBytes.toString('utf8');
   assertManagedConfigOwnership(existing);
   if (!existing) return;
   const parsed = SSHConfig.parse(existing) as SshConfigSection[];
@@ -1410,6 +1471,40 @@ async function readRawConfig(filePath: string): Promise<string> {
   }
 }
 
+async function readRawConfigBytes(filePath: string): Promise<Buffer> {
+  try {
+    return await fs.readFile(filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return Buffer.alloc(0);
+    throw error;
+  }
+}
+
+function managedConfigToken(bytes: Uint8Array): ManagedConfigWriteToken {
+  return createHash('sha256').update(bytes).digest('hex') as ManagedConfigWriteToken;
+}
+
+function assertManagedWriteToken(
+  token: ManagedConfigWriteToken | undefined,
+): asserts token is ManagedConfigWriteToken {
+  if (typeof token === 'string' && /^[a-f0-9]{64}$/.test(token)) return;
+  const error = new Error('managed SSH config write token is required') as Error & { code?: string };
+  error.code = MANAGED_CONFIG_WRITE_TOKEN_REQUIRED_CODE;
+  throw error;
+}
+
+function assertManagedConfigUnchanged(
+  currentBytes: Uint8Array,
+  expectedToken: ManagedConfigWriteToken,
+): void {
+  if (managedConfigToken(currentBytes) === expectedToken) return;
+  const conflict = new Error(
+    'SSH config changed after Cindy validated it; reload before retrying.',
+  ) as Error & { code?: string };
+  conflict.code = MANAGED_CONFIG_CONCURRENT_MODIFICATION_CODE;
+  throw conflict;
+}
+
 async function writeAtomicPreservingTarget(
   filePath: string,
   content: string,
@@ -1447,7 +1542,7 @@ async function writeAtomicPreservingTarget(
       const conflict = new Error(
         'SSH config changed while Cindy was preparing an update; retry the operation.',
       ) as Error & { code?: string };
-      conflict.code = 'SSH_CONFIG_CONCURRENT_MODIFICATION';
+      conflict.code = MANAGED_CONFIG_CONCURRENT_MODIFICATION_CODE;
       throw conflict;
     }
     await fs.rename(tempPath, target);
@@ -1467,7 +1562,7 @@ async function restoreManagedConfigIfUnchanged(
     await writeAtomicPreservingTarget(managedConfigPath, previousContent, publishedContent);
     return true;
   } catch (error) {
-    if ((error as { code?: string }).code === 'SSH_CONFIG_CONCURRENT_MODIFICATION') return false;
+    if ((error as { code?: string }).code === MANAGED_CONFIG_CONCURRENT_MODIFICATION_CODE) return false;
     throw error;
   }
 }

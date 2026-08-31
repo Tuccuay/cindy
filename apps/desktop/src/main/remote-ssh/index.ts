@@ -39,7 +39,10 @@ import {
   pushRemoteCodexAuth,
   expandHome,
   effectiveAuthenticationFingerprint,
+  redactSshSensitiveText,
+  MANAGED_CONFIG_CONCURRENT_MODIFICATION_CODE,
   MANAGED_CONFIG_OWNERSHIP_REQUIRED_CODE,
+  MANAGED_CONFIG_WRITE_TOKEN_REQUIRED_CODE,
   FileHostKeyStore,
   RemoteHost,
   type AddHostInput,
@@ -50,6 +53,7 @@ import {
   type InstallProgressEvent,
   type InstallResult,
   type ManagedHostAddReceipt,
+  type ManagedConfigWriteToken,
   type ReadSshConfigResult,
   type RemoteAgentKind,
 } from '@cindy/maker-remote-ssh';
@@ -122,6 +126,8 @@ import { ensureDaemonRunning } from '../maker-host/cc-manager-client.js';
 import { getMakerIfReady, softCloseCcSessionsForHost } from '../maker-host/index.js';
 import { withRehydrateCloseSuppressed } from '../maker-host/rehydrateCloseSuppression.js';
 import { RemoteHostHydrationQueue } from './hydration-queue.js';
+
+export { redactSshSensitiveText };
 
 const log = createLogger('remote-ssh/ipc');
 /**
@@ -836,17 +842,7 @@ function portableBasename(value: string): string {
 /** Remove main-only local paths before a status or error crosses IPC. */
 function redactHostLocalPaths(config: HostConfig, message: string | undefined): string | undefined {
   if (!message) return message;
-  const paths = [
-    config.identityFile,
-    config.sshAuthentication?.identityAgent,
-    ...(config.sshAuthentication?.configuredIdentityFiles ?? []),
-  ].filter((value): value is string => !!value && (value.includes('/') || value.includes('\\')))
-    .sort((left, right) => right.length - left.length);
-  let redacted = message;
-  for (const localPath of paths) {
-    redacted = redacted.split(localPath).join(portableBasename(localPath));
-  }
-  return redacted;
+  return redactSshSensitiveText(config, message);
 }
 
 function toRendererHostConfig(config: HostConfig): RendererHostConfig {
@@ -1030,11 +1026,56 @@ async function assertHostHasNoSessionReferences(
     }
   } catch (error) {
     if ((error as { code?: string }).code === 'PRECONDITION_FAILED') throw error;
+    const rawCode = (error as { code?: unknown }).code;
+    const safeCode = typeof rawCode === 'string' && /^[A-Z0-9_]{1,64}$/.test(rawCode)
+      ? rawCode
+      : undefined;
+    log.warn('SSH host reference check failed', {
+      hostId: id,
+      action,
+      errorType: error instanceof Error ? error.name : typeof error,
+      ...(safeCode ? { errorCode: safeCode } : {}),
+    });
     throwIpcError(
       'INTERNAL',
-      `host "${id}" 引用检查失败, 未${action} — 请重试: ${error instanceof Error ? error.message : String(error)}`,
+      'Unable to verify whether this SSH host is in use. No changes were made; please retry.',
     );
   }
+}
+
+function managedWriteTokenOrThrow(result: ReadSshConfigResult): ManagedConfigWriteToken {
+  if (result.managedConfigWriteToken) return result.managedConfigWriteToken;
+  log.warn('managed SSH config preflight produced no write token', {
+    errorType: 'contract',
+  });
+  throwIpcError('INTERNAL', 'Unable to prepare a safe SSH configuration update. No changes were made.');
+}
+
+function throwManagedConfigWriteError(action: 'update' | 'remove', error: unknown): never {
+  const code = (error as { code?: unknown }).code;
+  log.warn('managed SSH config write failed', {
+    action,
+    errorType: error instanceof Error ? error.name : typeof error,
+    ...(typeof code === 'string' && /^[A-Z0-9_]{1,64}$/.test(code)
+      ? { errorCode: code }
+      : {}),
+  });
+  if (code === MANAGED_CONFIG_CONCURRENT_MODIFICATION_CODE) {
+    throwIpcError(
+      'SSH_CONFIG_CONCURRENT_MODIFICATION',
+      'The SSH configuration changed on disk. Reload it and try again.',
+    );
+  }
+  if (code === MANAGED_CONFIG_OWNERSHIP_REQUIRED_CODE) {
+    throwIpcError(
+      'SSH_CONFIG_OWNERSHIP_REQUIRED',
+      'The existing Cindy SSH config is not owned by Cindy; add the ownership marker or choose another file.',
+    );
+  }
+  if (code === MANAGED_CONFIG_WRITE_TOKEN_REQUIRED_CODE) {
+    throwIpcError('INTERNAL', 'Unable to prepare a safe SSH configuration update. No changes were made.');
+  }
+  throwIpcError('SSH_CONFIG_IO_FAILED', SSH_CONFIG_WRITE_FAILED_MESSAGE);
 }
 
 function throwReloadRequired(action: string, error: unknown): never {
@@ -1235,13 +1276,14 @@ export function registerRemoteSshIpc(): void {
         managedByCindy: existing.config.managedByCindy,
       };
       const connectionFieldsChanged = editableConnectionFieldsChanged(existing.config, cfg);
+      let managedWriteToken: ManagedConfigWriteToken | undefined;
       if (connectionFieldsChanged) {
         const latest = await readLatestSshConfigOrThrow();
         const latestHost = latest.hosts.find((host) => host.id === input.id);
         if (!latestHost?.managedByCindy) {
           throwIpcError(
-            'PRECONDITION_FAILED',
-            `host "${input.id}" is no longer uniquely managed by Cindy; reload before editing`,
+            'SSH_CONFIG_OWNERSHIP_REQUIRED',
+            'This SSH host is no longer uniquely managed by Cindy. Reload the SSH configuration before editing.',
           );
         }
         if (remoteConnectionFieldsChanged(existing.config, latestHost)) {
@@ -1250,6 +1292,7 @@ export function registerRemoteSshIpc(): void {
             `host "${input.id}" changed on disk; reload before editing`,
           );
         }
+        managedWriteToken = managedWriteTokenOrThrow(latest);
         cfg.managedByCindy = true;
       }
       if (connectionFieldsChanged) await assertHostHasNoSessionReferences(input.id, '修改');
@@ -1257,18 +1300,11 @@ export function registerRemoteSshIpc(): void {
       if (connectionFieldsChanged) {
         let refreshError: unknown;
         try {
-          await updateManagedHostFields(cfg, managedSshConfigPath);
+          await updateManagedHostFields(cfg, managedSshConfigPath, managedWriteToken!);
         } catch (err) {
           // The live connection remains untouched until the managed write has
           // committed successfully.
-          log.warn('failed to write SSH config while updating host', { error: String(err) });
-          if ((err as { code?: string }).code === MANAGED_CONFIG_OWNERSHIP_REQUIRED_CODE) {
-            throwIpcError(
-              'SSH_CONFIG_OWNERSHIP_REQUIRED',
-              'The existing Cindy SSH config is not owned by Cindy; add the ownership marker or choose another file.',
-            );
-          }
-          throwIpcError('SSH_CONFIG_IO_FAILED', SSH_CONFIG_WRITE_FAILED_MESSAGE);
+          throwManagedConfigWriteError('update', err);
         }
         try {
           if (existing.getStatus() === 'ready') {
@@ -1319,21 +1355,18 @@ export function registerRemoteSshIpc(): void {
       const latest = await readLatestSshConfigOrThrow();
       const latestHost = latest.hosts.find((candidate) => candidate.id === id);
       if (!latestHost?.managedByCindy) {
-        throwIpcError('PRECONDITION_FAILED', `host "${id}" comes from SSH config and cannot be removed here`);
+        throwIpcError(
+          'SSH_CONFIG_OWNERSHIP_REQUIRED',
+          'This SSH host is no longer uniquely managed by Cindy. Reload the SSH configuration before removing it.',
+        );
       }
+      const managedWriteToken = managedWriteTokenOrThrow(latest);
       await assertHostHasNoSessionReferences(id, '删除');
       let refreshError: unknown;
       try {
-        await removeManagedHost(id, managedSshConfigPath);
+        await removeManagedHost(id, managedSshConfigPath, managedWriteToken);
       } catch (err) {
-        log.warn('failed to write SSH config while removing host', { error: String(err) });
-        if ((err as { code?: string }).code === MANAGED_CONFIG_OWNERSHIP_REQUIRED_CODE) {
-          throwIpcError(
-            'SSH_CONFIG_OWNERSHIP_REQUIRED',
-            'The existing Cindy SSH config is not owned by Cindy; add the ownership marker or choose another file.',
-          );
-        }
-        throwIpcError('SSH_CONFIG_IO_FAILED', SSH_CONFIG_WRITE_FAILED_MESSAGE);
+        throwManagedConfigWriteError('remove', err);
       }
       try {
         if (host.getStatus() === 'ready') {

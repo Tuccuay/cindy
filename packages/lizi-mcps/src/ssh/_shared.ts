@@ -8,7 +8,7 @@
  *    红线：调用方可能把密钥内联在命令里，回显会经统一日志路径落盘。
  */
 
-import type { SshHostSnapshotLike, SshPoolLike } from '../types.js';
+import type { SshHostSnapshotLike, SshMcpDeps, SshPoolLike } from '../types.js';
 import type { SshToolResult } from './registry.js';
 
 // ── payload helpers（与 xdt-helper/_payload.ts 同形） ───────────────────────
@@ -54,7 +54,25 @@ export type SshErrorCode =
 // ── host resolution ─────────────────────────────────────────────────────────
 
 /** ssh_list_hosts / HOST_NOT_FOUND 候选清单共用的精简视图。 */
-export function hostBrief(s: SshHostSnapshotLike): Record<string, unknown> {
+const REDACTION_FAILURE_TEXT = 'SSH error details are unavailable.';
+
+/** Fail closed if the host redactor is unavailable; never log either input. */
+export function safeRedactSensitiveText(
+  deps: Pick<SshMcpDeps, 'redactSensitiveText'>,
+  snapshot: SshHostSnapshotLike,
+  text: string,
+): string {
+  try {
+    return deps.redactSensitiveText(snapshot, text);
+  } catch {
+    return REDACTION_FAILURE_TEXT;
+  }
+}
+
+export function hostBrief(
+  s: SshHostSnapshotLike,
+  deps: Pick<SshMcpDeps, 'redactSensitiveText'>,
+): Record<string, unknown> {
   return {
     id: s.config.id,
     hostname: s.config.hostname,
@@ -63,28 +81,8 @@ export function hostBrief(s: SshHostSnapshotLike): Record<string, unknown> {
     authMethod: s.config.authMethod,
     status: s.status,
     ...(s.lastAuthLabel ? { lastAuthLabel: s.lastAuthLabel } : {}),
-    ...(s.lastError ? { lastError: redactHostLocalPaths(s, s.lastError) } : {}),
+    ...(s.lastError ? { lastError: safeRedactSensitiveText(deps, s, s.lastError) } : {}),
   };
-}
-
-/** Replace main-only credential paths before a host snapshot becomes model-visible. */
-function redactHostLocalPaths(snapshot: SshHostSnapshotLike, message: string): string {
-  const replacements = [
-    { value: snapshot.config.identityFile, replacement: '<identity-file>' },
-    {
-      value: snapshot.config.sshAuthentication?.identityAgent,
-      replacement: '<identity-agent>',
-    },
-    ...(snapshot.config.sshAuthentication?.configuredIdentityFiles ?? [])
-      .map((value) => ({ value, replacement: '<identity-file>' })),
-  ].filter(({ value }) => value?.includes('/') || value?.includes('\\'))
-    .sort((left, right) => right.value!.length - left.value!.length);
-
-  let redacted = message;
-  for (const { value, replacement } of replacements) {
-    redacted = redacted.split(value!).join(replacement);
-  }
-  return redacted;
 }
 
 export type ResolveHostResult =
@@ -98,7 +96,11 @@ export type ResolveHostResult =
  *   3. 都没有 → HOST_NOT_FOUND，附现有主机清单引导用户去「设置 → 远程连接」添加
  *      （v1 刻意不支持连未配置的主机——那会退回"猜 key / 猜 agent"的老路）。
  */
-export function resolveHost(pool: SshPoolLike, nameOrIp: string): ResolveHostResult {
+export function resolveHost(
+  pool: SshPoolLike,
+  nameOrIp: string,
+  deps: Pick<SshMcpDeps, 'redactSensitiveText'>,
+): ResolveHostResult {
   const snapshots = pool.list();
   const byId = snapshots.find((s) => s.config.id === nameOrIp);
   if (byId) return { ok: true, snapshot: byId };
@@ -111,7 +113,7 @@ export function resolveHost(pool: SshPoolLike, nameOrIp: string): ResolveHostRes
       result: errorPayload(
         'AMBIGUOUS_HOST',
         `hostname "${nameOrIp}" 命中多台已配置主机，请改用唯一的 alias（candidates 里的 id 字段）指定。`,
-        { candidates: byHostname.map(hostBrief) },
+        { candidates: byHostname.map((snapshot) => hostBrief(snapshot, deps)) },
       ),
     };
   }
@@ -121,7 +123,7 @@ export function resolveHost(pool: SshPoolLike, nameOrIp: string): ResolveHostRes
     result: errorPayload(
       'HOST_NOT_FOUND',
       `"${nameOrIp}" 不在已配置的 SSH 主机里。请告知用户到「设置 → 远程连接」添加该主机（或确认 ~/.ssh/config 里的 alias 拼写），不要退回手拼 ssh 命令。`,
-      { configuredHosts: snapshots.map(hostBrief) },
+      { configuredHosts: snapshots.map((snapshot) => hostBrief(snapshot, deps)) },
     ),
   };
 }
@@ -182,10 +184,11 @@ export interface ClassifiedSshError {
  */
 export function classifySshError(
   err: unknown,
+  deps: Pick<SshMcpDeps, 'redactSensitiveText'>,
   snapshot?: SshHostSnapshotLike,
 ): ClassifiedSshError {
   const rawMessage = err instanceof Error ? err.message : String(err);
-  const message = snapshot ? redactHostLocalPaths(snapshot, rawMessage) : rawMessage;
+  const message = snapshot ? safeRedactSensitiveText(deps, snapshot, rawMessage) : rawMessage;
 
   if (EXEC_TIMEOUT_RE.test(message)) {
     return {

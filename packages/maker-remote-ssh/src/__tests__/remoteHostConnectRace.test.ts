@@ -43,10 +43,12 @@ class FakeClient extends EventEmitter {
 const h = vi.hoisted(() => ({
   client: null as FakeClient | null,
   resolveAuth: vi.fn(async () => ({ label: 'agent' })),
+  createClient: vi.fn(),
+  hostKeyId: vi.fn((hostname: string, port: number) => `${hostname}:${port}`),
 }));
 
 vi.mock('ssh2', () => ({
-  Client: vi.fn(() => {
+  Client: h.createClient.mockImplementation(() => {
     h.client = new FakeClient();
     return h.client;
   }),
@@ -55,6 +57,10 @@ vi.mock('../credentials.js', () => ({
   resolveAuth: h.resolveAuth,
   defaultAgentEndpoint: vi.fn(() => ''),
 }));
+vi.mock('../hostKeys.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../hostKeys.js')>();
+  return { ...actual, hostKeyId: h.hostKeyId };
+});
 
 import { RemoteHost } from '../RemoteHost.js';
 import type { HostKeyStore } from '../hostKeys.js';
@@ -82,6 +88,38 @@ async function flush(): Promise<void> {
 }
 
 describe('RemoteHost arm/disconnect race', () => {
+  it('stops at the authentication guard before SSH transport or TOFU', async () => {
+    h.client = null;
+    h.createClient.mockClear();
+    h.hostKeyId.mockClear();
+    const unsupported = new Error('unsupported HostName token') as Error & { code?: string };
+    unsupported.code = 'SSH_CONFIG_AUTH_UNSUPPORTED';
+    h.resolveAuth.mockRejectedValueOnce(unsupported);
+    const store: HostKeyStore = {
+      reload: vi.fn(),
+      get: vi.fn(),
+      set: vi.fn(),
+    };
+    const host = new RemoteHost({
+      ...HOST_CONFIG,
+      sshAuthentication: {
+        identitiesOnly: false,
+        configuredIdentityFiles: [],
+        identityFileDirectiveSeen: false,
+        identityFileNoneSeen: false,
+        unsupportedReason: 'unsupported HostName token: %n',
+      },
+    }, { logger: noopLogger, hostKeys: store });
+
+    await expect(host.connect()).rejects.toMatchObject({
+      code: 'SSH_CONFIG_AUTH_UNSUPPORTED',
+    });
+    expect(h.createClient).not.toHaveBeenCalled();
+    expect(h.hostKeyId).not.toHaveBeenCalled();
+    expect(store.get).not.toHaveBeenCalled();
+    expect(store.set).not.toHaveBeenCalled();
+  });
+
   it('stale forwardIn success after disconnect neither marks armed nor leaks the bind', async () => {
     const host = new RemoteHost(HOST_CONFIG, { logger: noopLogger });
 

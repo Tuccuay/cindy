@@ -1,6 +1,10 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { HostConfig, ReadSshConfigResult } from '@cindy/maker-remote-ssh';
+import type {
+  HostConfig,
+  ManagedConfigWriteToken,
+  ReadSshConfigResult,
+} from '@cindy/maker-remote-ssh';
 
 const mocks = vi.hoisted(() => ({
   handlers: new Map<string, (...args: any[]) => Promise<unknown> | unknown>(),
@@ -14,7 +18,23 @@ const mocks = vi.hoisted(() => ({
   clearAgentProxy: vi.fn(),
   removeMcpPref: vi.fn(),
   invalidateMcpEndpoint: vi.fn(),
+  dbLimit: vi.fn(),
+  logWarn: vi.fn(),
 }));
+
+vi.mock('../../logger.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../logger.js')>();
+  return {
+    ...actual,
+    createLogger: () => ({
+      trace: vi.fn(),
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: mocks.logWarn,
+      error: vi.fn(),
+    }),
+  };
+});
 
 vi.mock('electron', async (importOriginal) => {
   const actual = await importOriginal<typeof import('electron')>();
@@ -54,7 +74,7 @@ vi.mock('../../localDb/client/current.js', () => ({
     drizzle: {
       select: () => ({
         from: () => ({
-          where: () => ({ limit: async () => [] }),
+          where: () => ({ limit: mocks.dbLimit }),
         }),
       }),
     },
@@ -128,7 +148,12 @@ function host(id: string, overrides: Partial<HostConfig> = {}): HostConfig {
 }
 
 function successfulRead(hosts: HostConfig[]): ReadSshConfigResult {
-  return { hosts, diagnostic: null, warnings: [] };
+  return {
+    hosts,
+    diagnostic: null,
+    warnings: [],
+    managedConfigWriteToken: 'a'.repeat(64) as ManagedConfigWriteToken,
+  };
 }
 
 function failedRead(): ReadSshConfigResult {
@@ -172,6 +197,8 @@ beforeEach(async () => {
   mocks.updateManagedHostFields.mockResolvedValue(undefined);
   mocks.removeManagedHost.mockResolvedValue(undefined);
   mocks.invalidateMcpEndpoint.mockReset();
+  mocks.dbLimit.mockReset().mockResolvedValue([]);
+  mocks.logWarn.mockReset();
   await getRemoteSshPool().hydrate([]);
   mocks.readSshConfigDetailed.mockImplementation(async () => successfulRead(
     getRemoteSshPool().list().map((snapshot) => snapshot.config),
@@ -208,6 +235,7 @@ describe('remote SSH mutation runtime semantics', () => {
     const result = await handler(REMOTE_SSH_INVOKE.RELOAD_CONFIG)({});
     expect(result.warningCount).toBe(1);
     expect(result).not.toHaveProperty('warnings');
+    expect(result).not.toHaveProperty('managedConfigWriteToken');
     expect(result.hosts[0].config).not.toHaveProperty('sshAuthentication');
     expect(result.hosts[0].config).not.toHaveProperty('identityFile');
     expect(result.hosts[0].config).toMatchObject({
@@ -242,9 +270,11 @@ describe('remote SSH mutation runtime semantics', () => {
       identityFileUnchanged: true,
     });
 
-    expect(mocks.updateManagedHostFields).toHaveBeenCalledWith(expect.objectContaining({
-      identityFile: current.identityFile,
-    }), expect.any(String));
+    expect(mocks.updateManagedHostFields).toHaveBeenCalledWith(
+      expect.objectContaining({ identityFile: current.identityFile }),
+      expect.any(String),
+      'a'.repeat(64),
+    );
     expect(result.host.config).toMatchObject({
       identityFileConfigured: true,
       identityFileName: 'preserve.key',
@@ -272,6 +302,69 @@ describe('remote SSH mutation runtime semantics', () => {
 
     expect(disconnect).not.toHaveBeenCalled();
     expect(live.config.hostname).toBe(current.hostname);
+  });
+
+  it.each([
+    ['UPDATE', mocks.updateManagedHostFields],
+    ['REMOVE', mocks.removeManagedHost],
+  ] as const)('maps a concurrent managed-file change during %s without mutating runtime state', async (operation, writer) => {
+    const current = host(`concurrent-${operation.toLowerCase()}`);
+    await getRemoteSshPool().hydrate([current]);
+    const live = getRemoteSshPool().get(current.id)!;
+    const disconnect = vi.spyOn(live, 'disconnect').mockResolvedValue();
+    const conflict = new Error('config changed') as Error & { code?: string };
+    conflict.code = 'SSH_CONFIG_CONCURRENT_MODIFICATION';
+    writer.mockRejectedValueOnce(conflict);
+
+    const request = operation === 'UPDATE'
+      ? handler(REMOTE_SSH_INVOKE.UPDATE)({}, {
+          ...current,
+          hostname: '192.0.2.199',
+          displayName: current.id,
+        })
+      : handler(REMOTE_SSH_INVOKE.REMOVE)({}, { id: current.id });
+    await expect(request).rejects.toMatchObject({
+      code: 'SSH_CONFIG_CONCURRENT_MODIFICATION',
+    });
+    expect(disconnect).not.toHaveBeenCalled();
+    expect(mocks.patchPref).not.toHaveBeenCalled();
+    expect(mocks.removePref).not.toHaveBeenCalled();
+    expect(getRemoteSshPool().get(current.id)).toBe(live);
+  });
+
+  it('rejects a missing managed write token as an internal contract error', async () => {
+    const current = host('missing-write-token');
+    await getRemoteSshPool().hydrate([current]);
+    mocks.readSshConfigDetailed.mockResolvedValueOnce({
+      hosts: [current],
+      diagnostic: null,
+      warnings: [],
+    });
+
+    await expect(handler(REMOTE_SSH_INVOKE.UPDATE)({}, {
+      ...current,
+      hostname: '192.0.2.188',
+      displayName: current.id,
+    })).rejects.toMatchObject({ code: 'INTERNAL' });
+    expect(mocks.updateManagedHostFields).not.toHaveBeenCalled();
+    expect(JSON.stringify(mocks.logWarn.mock.calls)).not.toContain('a'.repeat(64));
+  });
+
+  it('keeps database details out of IPC and the remote-ssh log scope', async () => {
+    const current = host('db-failure');
+    await getRemoteSshPool().hydrate([current]);
+    const sensitive = 'SQL SELECT secret FROM sessions at /Users/alice/cindy.db value=private';
+    mocks.dbLimit.mockRejectedValueOnce(Object.assign(new Error(sensitive), {
+      code: 'SQLITE_BUSY',
+    }));
+
+    const error = await handler(REMOTE_SSH_INVOKE.REMOVE)({}, { id: current.id })
+      .catch((caught) => caught);
+    expect(error).toMatchObject({ code: 'INTERNAL' });
+    expect(error.message).not.toContain(sensitive);
+    expect(JSON.stringify(mocks.logWarn.mock.calls)).not.toContain(sensitive);
+    expect(JSON.stringify(mocks.logWarn.mock.calls)).toContain('SQLITE_BUSY');
+    expect(mocks.removeManagedHost).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -493,7 +586,7 @@ describe('remote SSH mutation runtime semantics', () => {
       ...external,
       hostname: '192.0.2.111',
       displayName: 'Renamed',
-    })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    })).rejects.toMatchObject({ code: 'SSH_CONFIG_OWNERSHIP_REQUIRED' });
     expect(mocks.updateManagedHostFields).not.toHaveBeenCalled();
 
     await expect(handler(REMOTE_SSH_INVOKE.UPDATE)({}, {
@@ -521,7 +614,7 @@ describe('remote SSH mutation runtime semantics', () => {
       ...managed,
       hostname: '192.0.2.200',
       displayName: managed.id,
-    })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    })).rejects.toMatchObject({ code: 'SSH_CONFIG_OWNERSHIP_REQUIRED' });
 
     expect(mocks.updateManagedHostFields).not.toHaveBeenCalled();
   });
@@ -534,7 +627,7 @@ describe('remote SSH mutation runtime semantics', () => {
     ]));
 
     await expect(handler(REMOTE_SSH_INVOKE.REMOVE)({}, { id: managed.id }))
-      .rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+      .rejects.toMatchObject({ code: 'SSH_CONFIG_OWNERSHIP_REQUIRED' });
 
     expect(mocks.removeManagedHost).not.toHaveBeenCalled();
     expect(mocks.removePref).not.toHaveBeenCalled();

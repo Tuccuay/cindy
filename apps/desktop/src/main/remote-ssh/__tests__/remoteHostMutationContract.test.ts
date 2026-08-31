@@ -102,6 +102,8 @@ describe('remote SSH managed-host mutation contract', () => {
     expect(diskRead).toBeGreaterThan(-1);
     expect(readOnlyGuard).toBeGreaterThan(diskRead);
     expect(readOnlyGuard).toBeLessThan(write);
+    expect(body).toContain('managedWriteTokenOrThrow(latest)');
+    expect(body).toContain('managedSshConfigPath, managedWriteToken!');
     expect(write).toBeLessThan(invalidate);
     expect(invalidate).toBeLessThan(hydrate);
   });
@@ -117,6 +119,8 @@ describe('remote SSH managed-host mutation contract', () => {
     expect(diskRead).toBeGreaterThan(-1);
     expect(ownershipGuard).toBeGreaterThan(diskRead);
     expect(ownershipGuard).toBeLessThan(write);
+    expect(body).toContain('const managedWriteToken = managedWriteTokenOrThrow(latest);');
+    expect(body).toContain('managedSshConfigPath, managedWriteToken');
     expect(write).toBeLessThan(invalidate);
     expect(invalidate).toBeLessThan(hydrate);
   });

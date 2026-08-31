@@ -1193,7 +1193,6 @@ export class RemoteHost {
           }
         : {}),
     };
-    const attemptHostKeyId = hostKeyId(attemptConfig.hostname, attemptConfig.port);
     this.setStatus('connecting');
     this.hostKeyError = null;
     this.lastAuthError = null;
@@ -1216,6 +1215,9 @@ export class RemoteHost {
     // Do not create an ssh2 client after that cancellation boundary.
     if (!isCurrentAttempt()) throw cancelledError();
 
+    // Unsupported configuration fails in resolveAuth above. Only a usable,
+    // fully-resolved endpoint may participate in TOFU identity calculation.
+    const attemptHostKeyId = hostKeyId(attemptConfig.hostname, attemptConfig.port);
     const client = new Client();
     this.client = client;
 

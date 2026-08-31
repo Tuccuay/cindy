@@ -380,6 +380,8 @@ export interface SshPoolLike {
 export interface SshMcpDeps {
   getPool(): Promise<SshPoolLike>;
   ensureReady(id: string): Promise<void>;
+  /** Host-owned synchronous boundary redactor. It must not retain its inputs. */
+  redactSensitiveText(snapshot: SshHostSnapshotLike, text: string): string;
   logger?: LiziMcpLogger;
 }
 

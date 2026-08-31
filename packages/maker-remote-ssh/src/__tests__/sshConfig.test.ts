@@ -16,6 +16,7 @@ import {
   updateManagedHostFields,
 } from '../sshConfig.js';
 import type { HostConfig } from '../types.js';
+import type { ManagedConfigWriteToken } from '../sshConfig.js';
 
 let scratchDir: string;
 let mainConfig: string;
@@ -43,6 +44,13 @@ function host(overrides: Partial<HostConfig> & Pick<HostConfig, 'id'>): HostConf
     managedByCindy: true,
     ...overrides,
   };
+}
+
+async function managedWriteToken(): Promise<ManagedConfigWriteToken> {
+  await fs.writeFile(mainConfig, `Include ${managedConfig}\n`);
+  const result = await readSshConfigDetailed(mainConfig, { managedConfigPath: managedConfig });
+  expect(result.managedConfigWriteToken).toBeDefined();
+  return result.managedConfigWriteToken!;
 }
 
 function parsedIncludeEntries(raw: string): Array<{ value: string; before: string }> {
@@ -233,12 +241,18 @@ describe('OpenSSH config discovery', () => {
     ['an unset environment variable', 'Include ${CINDY_TEST_MISSING_SSH_DIR}/*.conf', 'is not set'],
     ['another user home', 'Include ~cindy-review-user-that-does-not-exist/.ssh/*.conf', 'cannot be resolved'],
     ['a malformed environment expression', 'Include ${CINDY_TEST_SSH_DIR/*.conf', 'malformed'],
-  ])('warns and skips Include with %s', async (_label, includeLine, warning) => {
+  ])('warns and fails closed after Include with %s', async (_label, includeLine, warning) => {
     delete process.env.CINDY_TEST_MISSING_SSH_DIR;
     await fs.writeFile(mainConfig, `${includeLine}\nHost usable\n  HostName 192.0.2.33\n`);
 
     const result = await readSshConfigDetailed(mainConfig);
-    expect(result.hosts).toMatchObject([{ id: 'usable', hostname: '192.0.2.33' }]);
+    expect(result.hosts).toMatchObject([{
+      id: 'usable',
+      hostname: '192.0.2.33',
+      sshAuthentication: {
+        unsupportedReason: expect.stringContaining('unconditional Include'),
+      },
+    }]);
     expect(result.warnings).toEqual(expect.arrayContaining([
       expect.stringContaining(warning),
     ]));
@@ -260,6 +274,35 @@ describe('OpenSSH config discovery', () => {
       ]);
     },
   );
+
+  it('treats a supported Include glob with no matches as an empty operation', async () => {
+    await fs.writeFile(mainConfig, [
+      'Include missing.d/*.conf',
+      'Host usable',
+      '  HostName 192.0.2.34',
+      '',
+    ].join('\n'));
+
+    const result = await readSshConfigDetailed(mainConfig);
+    expect(result.hosts[0]).toMatchObject({ id: 'usable', hostname: '192.0.2.34' });
+    expect(result.hosts[0]?.sshAuthentication?.unsupportedReason).toBeUndefined();
+  });
+
+  it('fails closed when one operand of a supported Include cannot expand', async () => {
+    await fs.writeFile(path.join(scratchDir, 'valid.conf'), 'Host included\n');
+    await fs.writeFile(mainConfig, [
+      'Include valid.conf ${CINDY_TEST_MISSING_SSH_DIR}/missing.conf',
+      'Host usable',
+      '',
+    ].join('\n'));
+    delete process.env.CINDY_TEST_MISSING_SSH_DIR;
+
+    const result = await readSshConfigDetailed(mainConfig);
+    expect(result.hosts.map((item) => item.id)).toEqual(['included', 'usable']);
+    for (const item of result.hosts) {
+      expect(item.sshAuthentication?.unsupportedReason).toContain('unconditional Include');
+    }
+  });
 
   it('fails closed when a concrete Host block depends on a conditional Include', async () => {
     await fs.writeFile(mainConfig, [
@@ -381,6 +424,28 @@ describe('OpenSSH config discovery', () => {
     expect(hosts[0]?.sshAuthentication?.unsupportedReason).toBeUndefined();
   });
 
+  it('fails closed only when effective CanonicalizeHostname enables canonicalization', async () => {
+    await fs.writeFile(mainConfig, [
+      'CanonicalDomains corp.example',
+      'Host safe',
+      '  CanonicalizeHostname no',
+      '  CanonicalizeHostname yes',
+      'Host enabled',
+      '  CanonicalizeHostname always',
+      'Host invalid',
+      '  CanonicalizeHostname maybe',
+      '',
+    ].join('\n'));
+
+    const hosts = await readSshConfig(mainConfig);
+    expect(hosts.find((item) => item.id === 'safe')?.sshAuthentication?.unsupportedReason)
+      .toBeUndefined();
+    expect(hosts.find((item) => item.id === 'enabled')?.sshAuthentication?.unsupportedReason)
+      .toContain('canonicalization');
+    expect(hosts.find((item) => item.id === 'invalid')?.sshAuthentication?.unsupportedReason)
+      .toContain('CanonicalizeHostname value');
+  });
+
   it('restores the parent Host * scope after an included file returns', async () => {
     await fs.writeFile(mainConfig, [
       'Host *',
@@ -402,6 +467,24 @@ describe('OpenSSH config discovery', () => {
       user: 'ubuntu',
       port: 2222,
     });
+  });
+
+  it('restores the root scope after an included file ends in a Host block', async () => {
+    await fs.writeFile(mainConfig, [
+      'Include extra.conf',
+      'Port 2200',
+      'Host bar',
+      '  HostName 192.0.2.8',
+      '',
+    ].join('\n'));
+    await fs.writeFile(path.join(scratchDir, 'extra.conf'), [
+      'Host foo',
+      '  HostName 192.0.2.7',
+      '',
+    ].join('\n'));
+
+    const hosts = await readSshConfig(mainConfig);
+    expect(hosts.find((item) => item.id === 'bar')).toMatchObject({ port: 2200 });
   });
 
   it('deduplicates cycles and repeated physical Include files', async () => {
@@ -471,7 +554,7 @@ describe('OpenSSH config discovery', () => {
   it.each([
     ['an unsupported token', '%n.example.com', '%n'],
     ['a trailing percent', 'example.com%', '%'],
-  ])('skips a host whose HostName contains %s', async (_label, hostname, token) => {
+  ])('keeps but rejects a host whose HostName contains %s', async (_label, hostname, token) => {
     await fs.writeFile(mainConfig, [
       'Host unsupported',
       `  HostName ${hostname}`,
@@ -481,12 +564,15 @@ describe('OpenSSH config discovery', () => {
     ].join('\n'));
 
     const result = await readSshConfigDetailed(mainConfig);
-    expect(result.hosts).toMatchObject([{
-      id: 'usable',
-      hostname: 'usable.example.com',
-    }]);
+    expect(result.hosts.find((item) => item.id === 'unsupported')).toMatchObject({
+      id: 'unsupported',
+      hostname: 'unsupported',
+      sshAuthentication: {
+        unsupportedReason: expect.stringContaining(`HostName token: ${token}`),
+      },
+    });
     expect(result.warnings).toContain(
-      `SSH host "unsupported" was skipped because HostName uses unsupported token "${token}".`,
+      `SSH host "unsupported" remains listed but unsupported because HostName uses token "${token}".`,
     );
   });
 
@@ -643,18 +729,22 @@ describe('OpenSSH config discovery', () => {
     expect(hostConfig?.sshAuthentication?.unsupportedReason).toBeUndefined();
   });
 
-  it('skips a host whose IdentityFile contains an unsupported token', async () => {
+  it('keeps but rejects a host whose IdentityFile contains an unsupported token', async () => {
     await fs.writeFile(mainConfig, [
       'Host unsupported-identity-token',
+      '  IdentitiesOnly yes',
       '  IdentityFile ~/.ssh/id_%f',
       'Host usable',
       '',
     ].join('\n'));
 
     const result = await readSshConfigDetailed(mainConfig);
-    expect(result.hosts.map((hostConfig) => hostConfig.id)).toEqual(['usable']);
+    expect(result.hosts.map((hostConfig) => hostConfig.id))
+      .toEqual(['unsupported-identity-token', 'usable']);
+    expect(result.hosts[0]?.sshAuthentication?.unsupportedReason)
+      .toContain('IdentityFile token: %f');
     expect(result.warnings).toContain(
-      'SSH host "unsupported-identity-token" was skipped because IdentityFile uses unsupported token "%f".',
+      'SSH host "unsupported-identity-token" remains listed but unsupported because IdentityFile uses token "%f".',
     );
   });
 
@@ -912,16 +1002,20 @@ describe('managed ownership', () => {
     await fs.writeFile(mainConfig, `Include ${managedConfig}\n`);
     await fs.writeFile(managedConfig, `${MANAGED_CONFIG_MARKER}\nHost managed\n  HostName 192.0.2.20\n`);
 
-    await expect(readSshConfig(mainConfig, { managedConfigPath: managedConfig }))
-      .resolves.toMatchObject([{ id: 'managed', source: 'ssh-config', managedByCindy: true }]);
+    const result = await readSshConfigDetailed(mainConfig, { managedConfigPath: managedConfig });
+    expect(result.hosts).toMatchObject([
+      { id: 'managed', source: 'ssh-config', managedByCindy: true },
+    ]);
+    expect(result.managedConfigWriteToken).toMatch(/^[a-f0-9]{64}$/);
   });
 
   it('does not treat a host-block comment as a managed-file ownership marker', async () => {
     await fs.writeFile(mainConfig, `Include ${managedConfig}\n`);
     await fs.writeFile(managedConfig, 'Host user-owned\n  # xdt-maker:managed=v1\n');
 
-    await expect(readSshConfig(mainConfig, { managedConfigPath: managedConfig }))
-      .resolves.toMatchObject([{ id: 'user-owned', managedByCindy: false }]);
+    const result = await readSshConfigDetailed(mainConfig, { managedConfigPath: managedConfig });
+    expect(result.hosts).toMatchObject([{ id: 'user-owned', managedByCindy: false }]);
+    expect(result.managedConfigWriteToken).toBeUndefined();
   });
 
   it('keeps managed aliases read-only when duplicated in any other file', async () => {
@@ -941,9 +1035,9 @@ describe('managed ownership', () => {
     await fs.writeFile(mainConfig, `Include ${managedConfig}\n`);
     await fs.writeFile(managedConfig, 'Host managed\n');
 
-    await expect(readSshConfig(mainConfig)).resolves.toMatchObject([
-      { id: 'managed', managedByCindy: false },
-    ]);
+    const result = await readSshConfigDetailed(mainConfig);
+    expect(result.hosts).toMatchObject([{ id: 'managed', managedByCindy: false }]);
+    expect(result.managedConfigWriteToken).toBeUndefined();
   });
 
   it('warns without discovering an existing managed file that is not Included', async () => {
@@ -1117,7 +1211,7 @@ describe('managed config writers', () => {
         authMethod: 'agent',
       }]);
 
-    await removeManagedHost('new-host', managedConfig);
+    await removeManagedHost('new-host', managedConfig, await managedWriteToken());
     await expect(fs.readFile(managedConfig, 'utf8')).resolves.toBe(`${MANAGED_CONFIG_MARKER}\n`);
   });
 
@@ -1297,6 +1391,7 @@ describe('managed config writers', () => {
       '',
     ].join('\n'));
 
+    const token = await managedWriteToken();
     await updateManagedHostFields(host({
       id: 'lab',
       hostname: '192.0.2.31',
@@ -1304,7 +1399,7 @@ describe('managed config writers', () => {
       port: 2222,
       authMethod: 'key',
       identityFile: '/tmp/lab.key',
-    }), managedConfig);
+    }), managedConfig, token);
 
     const raw = await fs.readFile(managedConfig, 'utf8');
     expect(raw).toContain('ProxyJump bastion');
@@ -1325,12 +1420,13 @@ describe('managed config writers', () => {
     await fs.chmod(managedConfig, 0o640);
     const modeBefore = (await fs.stat(managedConfig)).mode & 0o777;
 
+    const token = await managedWriteToken();
     await updateManagedHostFields(host({
       id: 'lab',
       hostname: '192.0.2.41',
       user: 'bob',
       port: 2222,
-    }), managedConfig);
+    }), managedConfig, token);
 
     const raw = await fs.readFile(managedConfig, 'utf8');
     expect(raw).toContain('HostName 192.0.2.41\r\n');
@@ -1339,6 +1435,47 @@ describe('managed config writers', () => {
     if (modeBefore === 0o640) {
       expect((await fs.stat(managedConfig)).mode & 0o777).toBe(modeBefore);
     }
+  });
+
+  it('rejects update when the managed file changed after preflight', async () => {
+    await fs.writeFile(managedConfig, [
+      MANAGED_CONFIG_MARKER,
+      'Host lab',
+      '  HostName 192.0.2.40',
+      '',
+    ].join('\n'));
+    const token = await managedWriteToken();
+    const external = `${await fs.readFile(managedConfig, 'utf8')}# external edit\n`;
+    await fs.writeFile(managedConfig, external);
+
+    await expect(updateManagedHostFields(host({ id: 'lab' }), managedConfig, token))
+      .rejects.toMatchObject({ code: 'SSH_CONFIG_CONCURRENT_MODIFICATION' });
+    await expect(fs.readFile(managedConfig, 'utf8')).resolves.toBe(external);
+  });
+
+  it('rejects remove when the managed file changed after preflight', async () => {
+    await fs.writeFile(managedConfig, [
+      MANAGED_CONFIG_MARKER,
+      'Host lab',
+      '  HostName 192.0.2.40',
+      '',
+    ].join('\n'));
+    const token = await managedWriteToken();
+    const external = `${await fs.readFile(managedConfig, 'utf8')}# external edit\n`;
+    await fs.writeFile(managedConfig, external);
+
+    await expect(removeManagedHost('lab', managedConfig, token))
+      .rejects.toMatchObject({ code: 'SSH_CONFIG_CONCURRENT_MODIFICATION' });
+    await expect(fs.readFile(managedConfig, 'utf8')).resolves.toBe(external);
+  });
+
+  it('treats a missing managed write token as an internal package contract error', async () => {
+    await fs.writeFile(managedConfig, `${MANAGED_CONFIG_MARKER}\nHost lab\n`);
+    await expect(removeManagedHost(
+      'lab',
+      managedConfig,
+      undefined as unknown as ManagedConfigWriteToken,
+    )).rejects.toMatchObject({ code: 'SSH_CONFIG_WRITE_TOKEN_REQUIRED' });
   });
 });
 

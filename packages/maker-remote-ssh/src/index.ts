@@ -115,10 +115,13 @@ export {
   removeHost,
   expandHome,
   MANAGED_CONFIG_MARKER,
+  MANAGED_CONFIG_CONCURRENT_MODIFICATION_CODE,
   MANAGED_CONFIG_OWNERSHIP_REQUIRED_CODE,
+  MANAGED_CONFIG_WRITE_TOKEN_REQUIRED_CODE,
 } from './sshConfig.js';
 export type {
   ManagedHostAddReceipt,
+  ManagedConfigWriteToken,
   ReadSshConfigOptions,
   ReadSshConfigResult,
   SshConfigDiagnostic,
@@ -152,3 +155,5 @@ export type {
   RemoteStatus,
   SshAuthenticationMetadata,
 } from './types.js';
+
+export { redactSshSensitiveText } from './sshRedaction.js';
