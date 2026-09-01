@@ -21,7 +21,10 @@
     "SSH_CONFIG_OWNERSHIP_REQUIRED": "Cindy はこの SSH 設定を安全に管理できません。再読み込みして、Cindy の所有マーカーとホストエイリアスの一意性を確認してください。",
     "SSH_CONFIG_AUTH_UNSUPPORTED": "Cindy はこのホストの一部の SSH 設定規則を安全に再現できません。ターミナルの SSH は動作する場合があります。Match、条件付き Include、IdentityAgent、IdentitiesOnly、公開鍵設定を確認してください。",
     "SSH_AGENT_UNAVAILABLE": "SSH Agent を使用できません。SSH Agent を起動し、ssh-add で対応する秘密鍵を読み込んでから再試行してください。",
-    "SSH_HOST_PREFS_WRITE_FAILED": "ホストは保存されていますが、表示名または Agent Proxy の設定を保存できませんでした。ローカルストレージの権限を確認して再試行してください。"
+    "SSH_HOST_PREFS_WRITE_FAILED": "ホストは保存されていますが、表示名または Agent Proxy の設定を保存できませんでした。ローカルストレージの権限を確認して再試行してください。",
+    "RIGHT_SIDEBAR_TOO_MANY_TABS": "このタスクのタブ数の上限に達しました。いくつかのタブを閉じてください",
+    "RIGHT_SIDEBAR_STATE_TOO_LARGE": "タブの内容が大きすぎるため、追加できません",
+    "RIGHT_SIDEBAR_UNKNOWN_KIND": "このタブの種類は現在使用できません"
   },
   "providerError": {
     "AUTH_INVALID": "API キーが無効か期限切れです（401）。キーを確認して再試行してください",
@@ -6660,6 +6663,13 @@
       "description": "自動更新を有効にするには、{{appName}} を「アプリケーション」フォルダに移動してください。",
       "move": "今すぐ移動（推奨）",
       "download": "手動でダウンロード"
+    },
+    "windowsRuntimeMissing": {
+      "title": "Microsoft Visual C++ ランタイムが必要です",
+      "description": "この PC にはアップデーターに必要な Microsoft Visual C++ ランタイムがありません。ダウンロード済みの更新は保持されます。Microsoft 公式の x64 ランタイムをインストールしてから、もう一度確認してください。",
+      "download": "ランタイムをダウンロード",
+      "retry": "もう一度確認",
+      "later": "後でインストール"
     },
     "moveToApplications": {
       "title": "アプリケーションフォルダに移動",
